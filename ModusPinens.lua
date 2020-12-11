@@ -149,11 +149,11 @@ do
 end
 
 -- do_after_combat(function, args...) to call protected functions once combat ends
-local do_after_combat, player_regen_enabled
+local do_after_combat, on_player_regen_enabled
 do
     local to_do_after_combat = {}
     
-    function player_regen_enabled()
+    function on_player_regen_enabled() -- PLAYER_REGEN_ENABLED event detects end of combat
         for func, args in pairs(to_do_after_combat) do
             func(unpack(args))
         end
@@ -324,7 +324,7 @@ local function get_waypoint_run_string(waypoint)
     return strconcat("/run C_Map.SetUserWaypoint(", waypoint.uiMapID, ",", waypoint.position.x, ",", waypoint.position.y, ")")
 end
 
--- Syntax: /way [map name|map number] x y [description]
+-- Parses syntax for commands like /way and /wayl: [map name|map number] x y [description]
 local function parse_waypoint_command(msg)
     local MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW = 7
     
@@ -516,6 +516,7 @@ local function parse_waypoint_command(msg)
     end
 end
 
+-- Set a user-specified waypoint, /way [map name|map number] x y [description]
 local function way(msg)
     local waypoint = parse_waypoint_command(msg)
     if waypoint then
@@ -559,13 +560,13 @@ local function wayc()
     end
 end
 
--- Generate a link using way syntax or a link to the current waypoint
+-- Generate a link using way syntax or a link to the current waypoint, /wayl [[map name|map number] x y [description]]
 local function wayl(msg)
     local waypoint = parse_waypoint_command(msg) or current_waypoint
     if waypoint then
         local x = floor(waypoint.position.x * 10000)
         local y = floor(waypoint.position.y * 10000)
-        local to_paste = strconcat("|cffffff00|Hworldmap:", waypoint.uiMapID, ":", x, ":", y, "|h[", MAP_PIN_HYPERLINK, "]|h|r")
+        local to_paste = strconcat("|cffffff00|Hworldmap:", waypoint.uiMapID, ":", x, ":", y, "|h[", MAP_PIN_HYPERLINK, "]|h|r") -- server rejects links with text other than "Map Pin" (MAP_PIN_HYPERLINK)
         local desc = waypoint.desc
         if desc then
             to_paste = strjoin(" ", to_paste, desc)
@@ -578,7 +579,7 @@ end
 
 -- !!!
 -- /wayr (maybe something else?)
--- given a /way, generate a copy-able /run command
+-- given a /way, generate a copy-able /run command for people without the addon
 
 -- Link a waypoint to the target and some target info in chat
 local function wayt()
@@ -598,9 +599,7 @@ local function wayt()
             end
             local x, y
             if target_position then
-                if C_CVar.GetCVar("rotateMinimap") == "1" then
-                    x, y = unrotate_minimap_coords(target_position:GetXY())
-                end
+                x, y = target_position:GetXY()
             else
                 -- Just use the player's position
                 x, y = C_Map.GetPlayerMapPosition(map, PLAYER):GetXY()
@@ -627,7 +626,7 @@ local function wayt()
     end    
 end
 
--- Link a waypoint to the player's position
+-- Paste a waypoint link to the player's position into chat
 local function wayme()
     local map = C_Map.GetBestMapForUnit(PLAYER)
     if can_set_waypoint(map) then
@@ -657,16 +656,17 @@ local function wayo()
     InterfaceOptionsFrame_OpenToCategory(moduspinens_frame)
 end
 
--- Set waypoint to the last minimap ping
-local wayp, minimap_ping = (function ()
+-- Set a waypoint to the last minimap ping
+local wayp, on_minimap_ping
+do
     local last_minimap_ping
     
-    local function wayp()
+    function wayp()
         set_waypoint(last_minimap_ping.uiMapID, last_minimap_ping.position, "Minimap Ping")
     end
 
     -- Event handler for MINIMAP_PING
-    local function minimap_ping(pinger, minimap_x, minimap_y)
+    function on_minimap_ping(pinger, minimap_x, minimap_y)
         if C_CVar.GetCVar("rotateMinimap") == "1" then
             minimap_x, minimap_y = unrotate_minimap_coords(minimap_x, minimap_y)
         end
@@ -678,16 +678,15 @@ local wayp, minimap_ping = (function ()
         local map_y = player_y - minimap_y * minimap_radius / map_height
         last_minimap_ping = UiMapPoint.CreateFromCoordinates(map, map_x, map_y)
     end
-    
-    return wayp, minimap_ping
-end)()
+end
 
 local function super_tracking_changed()
-    if not C_SuperTrack.IsSuperTrackingAnything() and current_waypoint and (saved_variables.automatic_supertrack_pins or saved_variables.semi_automatic_supertrack_pins) then
+    if not C_SuperTrack.IsSuperTrackingAnything() and current_waypoint and saved_variables.semi_automatic_supertrack_pins then
         C_SuperTrack.SetSuperTrackedUserWaypoint(true)
     end
 end
 
+-- Override waypoint map click handler, so it can't automatially un-supertrack added pin
 do
     -- Data providers are unlabeled, so we have to find it
     local waypoint_location_data_provider
@@ -701,22 +700,22 @@ do
         error("Couldn't find the map pin data provider.")
     end
 
-    -- Override map click handler, since it automatially un-supertracks any added pin
+    -- Override waypoint map click handler
     hooksecurefunc(waypoint_location_data_provider, "HandleClick", function ()
-        if current_waypoint and (saved_variables.automatic_supertrack_pins or saved_variables.semi_automatic_supertrack_pins and not C_SuperTrack.IsSuperTrackingAnything()) then
+        if current_waypoint and saved_variables.semi_automatic_supertrack_pins and (saved_variables.automatic_supertrack_pins or not C_SuperTrack.IsSuperTrackingAnything()) then
             C_SuperTrack.SetSuperTrackedUserWaypoint(true)
         end
     end)
 end
 
-local function user_waypoint_updated()
+local function on_user_waypoint_updated()
     local waypoint = C_Map.GetUserWaypoint()
     if waypoint then
         current_waypoint = to_local_map(waypoint)
         local display_name, display_x, display_y = get_waypoint_strings(current_waypoint)
         current_waypoint.string = strconcat(display_name, " (", display_x, ", ", display_y, ")")
         waypoint_history_add(waypoint)
-        if saved_variables.automatic_supertrack_pins or saved_variables.semi_automatic_supertrack_pins and not C_SuperTrack.IsSuperTrackingAnything() then
+        if saved_variables.semi_automatic_supertrack_pins and (saved_variables.automatic_supertrack_pins or not C_SuperTrack.IsSuperTrackingAnything()) then
             C_SuperTrack.SetSuperTrackedUserWaypoint(true)
         end
     else
@@ -724,7 +723,7 @@ local function user_waypoint_updated()
     end
 end
 
-local function player_logout()
+local function on_player_logout()
     if saved_variables.save_logout_waypoint and current_waypoint then
         saved_variables_per_character.logout_waypoint = current_waypoint
         saved_variables_per_character.logout_supertrack = C_SuperTrack.IsSuperTrackingUserWaypoint()
@@ -738,16 +737,162 @@ local function player_logout()
     ModusPinensSavedVariablesPerCharacter = saved_variables_per_character
 end
 
-local function addon_loaded()
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function check_button_sound(check_button)
+    if check_button:GetChecked() then
+        PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON);
+    else
+        PlaySound(SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_OFF);
+    end
+end
+
+local function create_check_button(text, tooltip, parent)
+    local check_button = CreateFrame("CheckButton", nil, parent)
+    check_button:SetSize(26, 26)
+    check_button:SetHitRectInsets(0, -100, 0, 0)
+    check_button:SetNormalTexture("Interface/Buttons/UI-CheckBox-Up")
+    check_button:SetPushedTexture("Interface/Buttons/UI-CheckBox-Down")
+    check_button:SetHighlightTexture("Interface/Buttons/UI-CheckBox-Highlight", "ADD")
+    check_button:SetCheckedTexture("Interface/Buttons/UI-CheckBox-Check")
+    check_button:SetDisabledCheckedTexture("Interface/Buttons/UI-CheckBox-Check-Disabled")
+    check_button:SetScript("OnClick", check_button_sound)
+    
+    local font_string = check_button:CreateFontString(nil, "ARTWORK", "GameFontHighlightLeft")
+    font_string:SetPoint("LEFT", check_button, "RIGHT", 2, 1)
+    font_string:SetText(text)
+    check_button.label = font_string
+    
+    return check_button
+end
+
+local function build_options_menu()
+    -- Title
+    local title = moduspinens_frame:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    title:SetJustifyH("LEFT")
+    title:SetJustifyV("TOP")
+    title:SetPoint("TOPLEFT", 16, -16)
+    title:SetText("Modus Pinens")
+    
+    -- Description
+    local sub_text = moduspinens_frame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    sub_text:SetNonSpaceWrap(true)
+    sub_text:SetMaxLines(3)
+    sub_text:SetJustifyH("LEFT")
+    sub_text:SetJustifyV("TOP")
+    sub_text:SetSize(0, 32)
+    sub_text:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
+    sub_text:SetPoint("RIGHT", -32, 0)
+    sub_text:SetText("Customize Map Pin behavior and commands.")
+    
+    -- Settings
+    -- Track New Pins if Not Tracking Anything
+    local semi_automatic_supertrack = create_check_button("Track New Pins If Not Tracking Anything", "Switch supertracking to newly placed pins if not tracking anything else.", moduspinens_frame)
+    semi_automatic_supertrack:SetPoint("TOPLEFT", sub_text, "BOTTOMLEFT", -2, -8) -- !!! 260 x divider
+    semi_automatic_supertrack:SetChecked(saved_variables.semi_automatic_supertrack_pins) -- !!! this should be in refresh
+    
+    -- Command Prefix
+    local prefix = CreateFrame("EditBox", nil, moduspinens_frame, "InputBoxTemplate") -- !!! tooltip should show in red that they'll need to reload UI
+    prefix:SetAutoFocus(false)
+    prefix:SetSize(146, 32)
+    prefix:SetPoint("TOPLEFT", semi_automatic_supertrack, "TOPRIGHT", 265, -16)
+    
+    local temp_prefix -- !!! clear this on refresh !!! save this as a key on the editbox itself instead
+    prefix:HookScript("OnEditFocusLost", function (edit_box)
+        temp_prefix = edit_box:GetText()
+    end)
+    prefix:SetScript("OnShow", function()
+        prefix:SetText(temp_prefix or saved_variables.prefix)
+    end)
+    -- Prefix can't have spaces
+    prefix:SetScript("OnSpacePressed", function (edit_box)
+        local cursor = edit_box:GetCursorPosition()
+        local text = edit_box:GetText()
+        edit_box:SetText(strsub(text, 1, cursor - 1) .. strsub(text, cursor + 1))
+        edit_box:SetCursorPosition(cursor - 1)
+    end)
+    
+    local prefix_label = prefix:CreateFontString(nil, "BACKGROUND", "GameFontNormal")
+    prefix_label:SetText("Command Prefix")
+    prefix_label:SetPoint("BOTTOMLEFT", prefix, "TOPLEFT", 0, 3)
+    
+    -- Confirm and reload buttons (have to reload for prefix to take effect)
+    local prefix_okay = CreateFrame("Button", nil, moduspinens_frame, "UIPanelButtonNoTooltipTemplate")
+    local prefix_reload = CreateFrame("Button", nil, moduspinens_frame, "UIPanelButtonNoTooltipTemplate")
+    prefix_okay:SetSize(80, 22)
+    prefix_okay:SetText("Okay")
+    prefix_okay:SetScript("OnClick", function ()
+        PlaySound(SOUNDKIT.GS_TITLE_OPTION_OK)
+        local text = prefix:GetText()
+        if text ~= "" and text ~= saved_variables.prefix then
+            saved_variables.prefix = text
+            -- !!! probably play a UI error message telling them they need to reload
+            prefix_reload:Show() -- !!! Need to show this after Default too, if the prefix wasn't default (should probably also show a UI error message)
+        end
+    end)
+    prefix_okay:SetPoint("LEFT", prefix, "RIGHT")
+    prefix_reload:SetSize(80, 22)
+    prefix_reload:SetText("Reload")
+    prefix_reload:SetScript("OnClick", function ()
+        C_UI.Reload()
+    end)
+    prefix_reload:SetPoint("LEFT", prefix_okay, "RIGHT")
+    prefix_reload:Hide() -- !!! hide this again on refresh when we clear temp_prefix
+    
+    -- Always Track New Pins
+    local automatic_supertrack = create_check_button("Always Track New Pins", "Automatically switch supertracking to newly placed pins.", moduspinens_frame)
+    automatic_supertrack:SetPoint("TOPLEFT", semi_automatic_supertrack, "BOTTOMLEFT", 16, -8)
+    automatic_supertrack:SetChecked(saved_variables.automatic_supertrack_pins) -- !!! this should be in refresh
+    if not saved_variables.semi_automatic_supertrack_pins then -- !!! this should be in refresh
+        automatic_supertrack:Disable()
+        automatic_supertrack.label:SetTextColor(GRAY_FONT_COLOR.r, GRAY_FONT_COLOR.g, GRAY_FONT_COLOR.b)
+        -- !!! remove tooltip
+    end
+    
+    -- Unlimited Pin Distance
+    local unlimited_pin_distance = create_check_button("Unlimited Pin Distance", "Always show on-screen UI regardless of distance to pin.", moduspinens_frame)
+    unlimited_pin_distance:SetPoint("TOPLEFT", automatic_supertrack, "BOTTOMLEFT", -16, -8)
+    -- !!! -8, -8 for first 
+end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+local function on_addon_loaded()
     -- Fill in default options
     do
         local default_saved_variables = {
-            prefix = "way", -- !!! need to offer a reload if this changes
+            prefix = "way",
             unlimited_pin_distance = true,
             min_pin_distance = 10,
             max_pin_distance = 1000, -- !!! should be greyed out if unlimited pin distance is on
             semi_automatic_supertrack_pins = true, -- !!! this should be greyed out if automatic is on
-            automatic_supertrack_pins = true, -- !!! if true it should automatic supertrack when you click a hyperlinked pin too
+            automatic_supertrack_pins = true,
             save_logout_waypoint = true,
             automatic_clear = false,
             clear_distance = 10, -- !!! grey out if automatic clear is off
@@ -755,16 +900,23 @@ local function addon_loaded()
             keep_history = true
         }
         if not ModusPinensSavedVariables then
-            ModusPinensSavedVariables = {}
-        end
-        for saved_variable, default in pairs(default_saved_variables) do
-            saved_variables[saved_variable] = ModusPinensSavedVariables[saved_variable] or default
+            saved_variables = default_saved_variables
+        else
+            for name, default in pairs(default_saved_variables) do
+                local saved = ModusPinensSavedVariables[name]
+                if saved == nil then
+                    -- Add default value for new option
+                    saved_variables[name] = default
+                else
+                    saved_variables[name] = saved
+                end
+            end
         end
     end
     saved_variables_per_character = ModusPinensSavedVariablesPerCharacter or {}
     
-    -- Build the options/help menu
-    -- !!!
+    -- Build the Interface options panel
+    build_options_menu()
     
     -- Add hooks that depend on options
     -- Clear active pin when user comes within user-defined distance
@@ -887,7 +1039,7 @@ local function addon_loaded()
             {"T", wayt, {"t", "tar", "target"}},
             {"ME", wayme, {"me"}},
             {"L", wayl, {"l", "link"}},
-            {"O", wayo, {"o", "option", "options", "h", "help"}}
+            {"O", wayo, {"o", "option", "options", "h", "help", "moduspinens"}}
         }
         local slash_prefix = "/" .. saved_variables.prefix
         for i, slash_command in ipairs(slash_commands) do
@@ -902,11 +1054,11 @@ local function addon_loaded()
     do
         moduspinens_frame:UnregisterEvent("ADDON_LOADED")
         local events = {
-            PLAYER_LOGOUT = player_logout,
-            MINIMAP_PING = minimap_ping,
-            SUPER_TRACKING_CHANGED = super_tracking_changed,
-            USER_WAYPOINT_UPDATED = user_waypoint_updated,
-            PLAYER_REGEN_ENABLED = player_regen_enabled
+            PLAYER_LOGOUT = on_player_logout,
+            MINIMAP_PING = on_minimap_ping,
+            SUPER_TRACKING_CHANGED = on_super_tracking_changed,
+            USER_WAYPOINT_UPDATED = on_user_waypoint_updated,
+            PLAYER_REGEN_ENABLED = on_player_regen_enabled
         }
         for event, handler in pairs(events) do
             moduspinens_frame:RegisterEvent(event)
@@ -959,6 +1111,6 @@ end
 moduspinens_frame:RegisterEvent("ADDON_LOADED")
 moduspinens_frame:SetScript("OnEvent", function(self, event, addon)
     if event == "ADDON_LOADED" and addon == "ModusPinens" then
-        addon_loaded()
+        on_addon_loaded()
     end
 end)
