@@ -4,6 +4,8 @@
 -- !!! let users make lists of waypoints (make sure to only play sound once if adding a bunch of pins to the map together)
 -- !!! show coords in map (and on minimap?)
 
+-- Hooks that depend on 
+
 local PLAYER = "player"
 
 local moduspinens_frame = CreateFrame("Frame")
@@ -209,6 +211,47 @@ local function is_pin_visible_on_open_map()
     end
     return false
 end
+
+-- For clicks to chat waypoint links, use adjacent text for the waypoint desc (looks for text to the right of the link first)
+hooksecurefunc("ChatFrame_OnHyperlinkShow", function (self, link, text)
+    if strsub(link, 1, 8) == "worldmap" then
+        local map_point = C_Map.GetUserWaypointFromHyperlink(link)
+        if map_point and C_Map.CanSetUserWaypointOnMap(map_point.uiMapID) then
+            -- Blizzard didn't bother to add sounds for this if the map is open, so let's add them
+            if is_pin_visible_on_open_map() then
+                PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CLICK_TO_PLACE, nil, SOUNDKIT_ALLOW_DUPLICATES)
+            end
+            -- Search through the chat frame for the message
+            local i = self:GetNumMessages()
+            while i > 0 do
+                local chat_text = self:GetMessageInfo(i)
+                local start_pos, end_pos = strfind(chat_text, text, 1, true)
+                if end_pos then
+                    -- First see if there's any text we can use to the right of the hyperlink
+                    local right = strtrim(strsub(chat_text, end_pos + 1))
+                    if right == "" then
+                        -- No text to the right, so check for text to the left
+                        local left = strtrim(strsub(chat_text, 1, start_pos - 1))
+                        local left_strip_hyperlinks = select(4, ExtractHyperlinkString(left))
+                        if left_strip_hyperlinks then
+                            local colon_pos = strfind(left_strip_hyperlinks, ":", 1, true)
+                            if colon_pos then
+                                left = strtrim(strsub(left_strip_hyperlinks, colon_pos + 1))
+                            end
+                        end
+                        if left ~= "" then
+                            current_waypoint.desc = left
+                        end
+                    else
+                        current_waypoint.desc = right
+                    end
+                    break
+                end
+                i = i - 1
+            end
+        end
+    end
+end)
 
 -- Track the last 100 waypoints we've set
 local waypoint_history_add, waypoint_history_last, waypoint_history_save, waypoint_history_restore
@@ -667,16 +710,18 @@ do
 
     -- Event handler for MINIMAP_PING
     function on_minimap_ping(pinger, minimap_x, minimap_y)
-        if C_CVar.GetCVar("rotateMinimap") == "1" then
-            minimap_x, minimap_y = unrotate_minimap_coords(minimap_x, minimap_y)
-        end
         local map = C_Map.GetBestMapForUnit(PLAYER)
-        local map_width, map_height = C_Map.GetMapWorldSize(map)
-        local minimap_radius = C_Minimap.GetViewRadius()
-        local player_x, player_y = C_Map.GetPlayerMapPosition(map, PLAYER):GetXY()
-        local map_x = player_x + minimap_x * minimap_radius / map_width
-        local map_y = player_y - minimap_y * minimap_radius / map_height
-        last_minimap_ping = UiMapPoint.CreateFromCoordinates(map, map_x, map_y)
+        if C_Map.CanSetUserWaypointOnMap(map) then
+            if C_CVar.GetCVar("rotateMinimap") == "1" then
+                minimap_x, minimap_y = unrotate_minimap_coords(minimap_x, minimap_y)
+            end
+            local map_width, map_height = C_Map.GetMapWorldSize(map)
+            local minimap_radius = C_Minimap.GetViewRadius()
+            local player_x, player_y = C_Map.GetPlayerMapPosition(map, PLAYER):GetXY()
+            local map_x = player_x + minimap_x * minimap_radius / map_width
+            local map_y = player_y - minimap_y * minimap_radius / map_height
+            last_minimap_ping = UiMapPoint.CreateFromCoordinates(map, map_x, map_y)
+        end
     end
 end
 
@@ -985,47 +1030,6 @@ local function on_addon_loaded()
             return alpha
         end
     end
-    
-    -- For clicks to chat waypoint links, use adjacent text for the waypoint desc (looks for text to the right of the link first)
-    hooksecurefunc("ChatFrame_OnHyperlinkShow", function (self, link, text)
-        if strsub(link, 1, 8) == "worldmap" then
-            local map_point = C_Map.GetUserWaypointFromHyperlink(link)
-            if map_point and C_Map.CanSetUserWaypointOnMap(map_point.uiMapID) then
-                -- Blizzard didn't bother to add sounds for this if the map is open, so let's add them
-                if is_pin_visible_on_open_map() then
-                    PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CLICK_TO_PLACE, nil, SOUNDKIT_ALLOW_DUPLICATES)
-                end
-                -- Search through the chat frame for the message
-                local i = self:GetNumMessages()
-                while i > 0 do
-                    local chat_text = self:GetMessageInfo(i)
-                    local start_pos, end_pos = strfind(chat_text, text, 1, true)
-                    if end_pos then
-                        -- First see if there's any text we can use to the right of the hyperlink
-                        local right = strtrim(strsub(chat_text, end_pos + 1))
-                        if right == "" then
-                            -- No text to the right, so check for text to the left
-                            local left = strtrim(strsub(chat_text, 1, start_pos - 1))
-                            local left_strip_hyperlinks = select(4, ExtractHyperlinkString(left))
-                            if left_strip_hyperlinks then
-                                local colon_pos = strfind(left_strip_hyperlinks, ":", 1, true)
-                                if colon_pos then
-                                    left = strtrim(strsub(left_strip_hyperlinks, colon_pos + 1))
-                                end
-                            end
-                            if left ~= "" then
-                                current_waypoint.desc = left
-                            end
-                        else
-                            current_waypoint.desc = right
-                        end
-                        break
-                    end
-                    i = i - 1
-                end
-            end
-        end
-    end)
 
     -- Set up slash commands
     do
