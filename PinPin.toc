@@ -1,8 +1,8 @@
 ## Interface: 90002
 ## Author: samueldcorbin
-## Title: Modus Pinens
+## Title: PinPin
 ## Version: 1.0.0
 ## Notes: Adds pin-related chat commands.
-## SavedVariables: ModusPinensSavedVariables
-## SavedVariablesPerCharacter: ModusPinensSavedVariablesPerCharacter
-ModusPinens.lua
+## SavedVariables: PinPinSavedVariables
+## SavedVariablesPerCharacter: PinPinSavedVariablesPerCharacter
+PinPin.lua

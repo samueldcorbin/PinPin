@@ -3,13 +3,16 @@
 -- !!!        can printed pins (that aren't sent over a channel) have custom text?
 -- !!! let users make lists of waypoints (make sure to only play sound once if adding a bunch of pins to the map together)
 -- !!! show coords in map (and on minimap?)
+-- !!! we CAN pin to many unpinnable maps by pinning to parent instead
+--  !!!is is this reliable?
+--  !!!can we enable to pin button on the map too?
 
 -- Hooks that depend on 
 
 local PLAYER = "player"
 
-local moduspinens_frame = CreateFrame("Frame")
-moduspinens_frame.name = "Modus Pinens"
+local pinpin_frame = CreateFrame("Frame")
+pinpin_frame.name = "PinPin"
 
 local saved_variables = {}
 local saved_variables_per_character = {}
@@ -308,6 +311,7 @@ end
 local function set_waypoint(map, position, desc)
     if can_set_waypoint(map) then
         local map_point = UiMapPoint.CreateFromVector2D(map, position)
+        C_Map.ClearUserWaypoint() -- waypoint change event doesn't fire if setting same waypoint, but we need that to fire to update supertracking if auto-supertracking is on, so clear it first
         C_Map.SetUserWaypoint(map_point)
         current_waypoint.desc = strtrim(desc)
         if is_pin_visible_on_open_map() then
@@ -330,26 +334,21 @@ end
 -- Round number to specified decimal places
 local function round_number(number, places)
     local mult = 10 ^ places
-    return floor(number * mult + 0.5) / mult -- important to round rather than truncate since C_Map.GetUserWaypoint gives back slightly different values than what you put into C_Map.SetUserWaypoint
+    return floor(number * mult + 0.5) / mult
 end
 
 -- e.g., given 1.31, 1.2, returns 2 because .31 goes to 2 decimal places (and that's more places than .2)
 -- useful so we can print "1.31, 1.20" rather than "1.31, 1.2"
 local function longest_fractional_length(...)
     local nums = {...}
-    for places = 0, math.huge do
-        local mult = 10 ^ places
-        local found_fraction = false
-        for _, num in ipairs(nums) do
-            if num * mult % 1 > 0 then
-                found_fraction = true
-                break
-            end
-        end
-        if not found_fraction then
-            return places
+    local places = 0
+    for _, num in ipairs(nums) do
+        test_places = #tostring(num % 1) - 2
+        if test_places > places then
+            places = test_places
         end
     end
+    return places
 end
 
 local function get_waypoint_strings(waypoint)
@@ -358,6 +357,9 @@ local function get_waypoint_strings(waypoint)
     local x = round_number(waypoint.position.x * 100, DECIMAL_PLACES)
     local y = round_number(waypoint.position.y * 100, DECIMAL_PLACES)
     local places = longest_fractional_length(x, y)
+    if places > DECIMAL_PLACES then -- in case of floating precision problems
+        places = DECIMAL_PLACES
+    end
     local format_string = strconcat("%.", places, "f")
     return map_id_to_unique_name[waypoint.uiMapID], format(format_string, x), format(format_string, y)
 end
@@ -384,8 +386,8 @@ local function parse_waypoint_command(msg)
             right_sep = "."
             wrong_sep = ","
         end
-        local wrong_sep_pattern = strjoin("(%d)", wrong_locale_dec, "(%d)")
-        local right_step_pattern = strjoin("%1", locale_dec, "%2")
+        local wrong_sep_pattern = strconcat("(%d)", wrong_sep, "(%d)")
+        local right_sep_pattern = strconcat("%1", right_sep, "%2")
         msg = msg:gsub(wrong_sep_pattern, right_sep_pattern)
 
         -- Tokenize
@@ -567,16 +569,32 @@ local function parse_waypoint_command(msg)
                             if C_Map.CanSetUserWaypointOnMap(map) then
                                 return {uiMapID = map, position = CreateVector2D(first_number / 100, second_number / 100), desc = strconcat(unpack(desc_tokens))}
                             end
-                        else
-                            -- pin in the zone the player is currently in
-                            return {uiMapID = C_Map.GetBestMapForUnit(PLAYER), position = CreateVector2D(first_number / 100, second_number / 100), desc = strconcat(unpack(desc_tokens))}
                         end
+                        -- if map is closed or we can't pin to map zone, pin in the zone the player is currently in
+                        return {uiMapID = C_Map.GetBestMapForUnit(PLAYER), position = CreateVector2D(first_number / 100, second_number / 100), desc = strconcat(unpack(desc_tokens))}
                     end
                 end
             end
         end
     end
     return nil
+end
+
+tester = function ()
+    scroll_container = WorldMapFrame.ScrollContainer
+    local x, y = scroll_container:NormalizeUIPosition(scroll_container:GetCursorPosition())
+    print(x, y)
+    local pos = CreateVector2D(x, y) -- map pos are 0-1
+    local map = C_Map.GetBestMapForUnit(PLAYER)
+    print(map)
+    local parent_map = C_Map.GetMapInfo(map).parentMapID
+    print(parent_map)
+    local continent, world_pos = C_Map.GetWorldPosFromMapPos(map, pos)
+    print(continent, world_pos.x, world_pos.y) -- world pos are huge numbers
+    local return_map, parent_pos = C_Map.GetMapPosFromWorldPos(continent, world_pos, parent_map) -- first return is same as parent_map, returns nil for dungeons
+    print(return_map, parent_pos.x, parent_pos.y)
+    local map_point = UiMapPoint.CreateFromVector2D(parent_map, parent_pos)
+    C_Map.SetUserWaypoint(map_point)
 end
 
 -- Set a user-specified waypoint, /way [map name|map number] x y [description]
@@ -716,7 +734,7 @@ end
 
 -- Open options/help
 local function wayo()
-    InterfaceOptionsFrame_OpenToCategory(moduspinens_frame)
+    InterfaceOptionsFrame_OpenToCategory(pinpin_frame)
 end
 
 -- Set a waypoint to the last minimap ping
@@ -746,6 +764,7 @@ do
 end
 
 local function super_tracking_changed()
+    print("Super tracking changed") -- !!!
     if not C_SuperTrack.IsSuperTrackingAnything() and current_waypoint and saved_variables.semi_automatic_supertrack_pins then
         C_SuperTrack.SetSuperTrackedUserWaypoint(true)
     end
@@ -774,6 +793,7 @@ do
 end
 
 local function on_user_waypoint_updated()
+    print("Updated")
     local waypoint = C_Map.GetUserWaypoint()
     if waypoint then
         current_waypoint = to_local_map(waypoint)
@@ -781,7 +801,10 @@ local function on_user_waypoint_updated()
         current_waypoint.string = strconcat(display_name, " (", display_x, ", ", display_y, ")")
         waypoint_history_add(waypoint)
         if saved_variables.semi_automatic_supertrack_pins and (saved_variables.automatic_supertrack_pins or not C_SuperTrack.IsSuperTrackingAnything()) then
+            print("Setting supertracking to true") -- !!!
+            print(C_SuperTrack.IsSuperTrackingUserWaypoint())
             C_SuperTrack.SetSuperTrackedUserWaypoint(true)
+            print(C_SuperTrack.IsSuperTrackingUserWaypoint())
         end
     else
         current_waypoint = nil
@@ -798,8 +821,8 @@ local function on_player_logout()
         saved_variables_per_character.history = waypoint_history_save()
     end
     
-    ModusPinensSavedVariables = saved_variables
-    ModusPinensSavedVariablesPerCharacter = saved_variables_per_character
+    PinPinSavedVariables = saved_variables
+    PinPinSavedVariablesPerCharacter = saved_variables_per_character
 end
 
 
@@ -844,14 +867,14 @@ end
 
 local function build_options_menu()
     -- Title
-    local title = moduspinens_frame:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    local title = pinpin_frame:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
     title:SetJustifyH("LEFT")
     title:SetJustifyV("TOP")
     title:SetPoint("TOPLEFT", 16, -16)
-    title:SetText("Modus Pinens")
+    title:SetText("PinPin")
     
     -- Description
-    local sub_text = moduspinens_frame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    local sub_text = pinpin_frame:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     sub_text:SetNonSpaceWrap(true)
     sub_text:SetMaxLines(3)
     sub_text:SetJustifyH("LEFT")
@@ -863,12 +886,12 @@ local function build_options_menu()
     
     -- Settings
     -- Track New Pins if Not Tracking Anything
-    local semi_automatic_supertrack = create_check_button("Track New Pins If Not Tracking Anything", "Switch supertracking to newly placed pins if not tracking anything else.", moduspinens_frame)
+    local semi_automatic_supertrack = create_check_button("Track New Pins If Not Tracking Anything", "Switch supertracking to newly placed pins if not tracking anything else.", pinpin_frame)
     semi_automatic_supertrack:SetPoint("TOPLEFT", sub_text, "BOTTOMLEFT", -2, -8) -- !!! 260 x divider
     semi_automatic_supertrack:SetChecked(saved_variables.semi_automatic_supertrack_pins) -- !!! this should be in refresh
     
     -- Command Prefix
-    local prefix = CreateFrame("EditBox", nil, moduspinens_frame, "InputBoxTemplate") -- !!! tooltip should show in red that they'll need to reload UI
+    local prefix = CreateFrame("EditBox", nil, pinpin_frame, "InputBoxTemplate") -- !!! tooltip should show in red that they'll need to reload UI
     prefix:SetAutoFocus(false)
     prefix:SetSize(146, 32)
     prefix:SetPoint("TOPLEFT", semi_automatic_supertrack, "TOPRIGHT", 265, -16)
@@ -893,8 +916,8 @@ local function build_options_menu()
     prefix_label:SetPoint("BOTTOMLEFT", prefix, "TOPLEFT", 0, 3)
     
     -- Confirm and reload buttons (have to reload for prefix to take effect)
-    local prefix_okay = CreateFrame("Button", nil, moduspinens_frame, "UIPanelButtonNoTooltipTemplate")
-    local prefix_reload = CreateFrame("Button", nil, moduspinens_frame, "UIPanelButtonNoTooltipTemplate")
+    local prefix_okay = CreateFrame("Button", nil, pinpin_frame, "UIPanelButtonNoTooltipTemplate")
+    local prefix_reload = CreateFrame("Button", nil, pinpin_frame, "UIPanelButtonNoTooltipTemplate")
     prefix_okay:SetSize(80, 22)
     prefix_okay:SetText("Okay")
     prefix_okay:SetScript("OnClick", function ()
@@ -916,7 +939,7 @@ local function build_options_menu()
     prefix_reload:Hide() -- !!! hide this again on refresh when we clear temp_prefix
     
     -- Always Track New Pins
-    local automatic_supertrack = create_check_button("Always Track New Pins", "Automatically switch supertracking to newly placed pins.", moduspinens_frame)
+    local automatic_supertrack = create_check_button("Always Track New Pins", "Automatically switch supertracking to newly placed pins.", pinpin_frame)
     automatic_supertrack:SetPoint("TOPLEFT", semi_automatic_supertrack, "BOTTOMLEFT", 16, -8)
     automatic_supertrack:SetChecked(saved_variables.automatic_supertrack_pins) -- !!! this should be in refresh
     if not saved_variables.semi_automatic_supertrack_pins then -- !!! this should be in refresh
@@ -926,7 +949,7 @@ local function build_options_menu()
     end
     
     -- Unlimited Pin Distance
-    local unlimited_pin_distance = create_check_button("Unlimited Pin Distance", "Always show on-screen UI regardless of distance to pin.", moduspinens_frame)
+    local unlimited_pin_distance = create_check_button("Unlimited Pin Distance", "Always show on-screen UI regardless of distance to pin.", pinpin_frame)
     unlimited_pin_distance:SetPoint("TOPLEFT", automatic_supertrack, "BOTTOMLEFT", -16, -8)
     -- !!! -8, -8 for first 
 end
@@ -964,11 +987,11 @@ local function on_addon_loaded()
             better_tooltips = true,
             keep_history = true
         }
-        if not ModusPinensSavedVariables then
+        if not PinPinSavedVariables then
             saved_variables = default_saved_variables
         else
             for name, default in pairs(default_saved_variables) do
-                local saved = ModusPinensSavedVariables[name]
+                local saved = PinPinSavedVariables[name]
                 if saved == nil then
                     -- Add default value for new option
                     saved_variables[name] = default
@@ -978,7 +1001,7 @@ local function on_addon_loaded()
             end
         end
     end
-    saved_variables_per_character = ModusPinensSavedVariablesPerCharacter or {}
+    saved_variables_per_character = PinPinSavedVariablesPerCharacter or {}
     
     -- Build the Interface options panel
     build_options_menu()
@@ -1063,20 +1086,20 @@ local function on_addon_loaded()
             {"T", wayt, {"t", "tar", "target"}},
             {"ME", wayme, {"me"}},
             {"L", wayl, {"l", "link"}},
-            {"O", wayo, {"o", "option", "options", "h", "help", "moduspinens"}}
+            {"O", wayo, {"o", "option", "options", "h", "help", "pinpin"}}
         }
         local slash_prefix = "/" .. saved_variables.prefix
         for i, slash_command in ipairs(slash_commands) do
             for j, command in ipairs(slash_command[3]) do
-                _G[strconcat("SLASH_MODUSPINENS_WAY", slash_command[1], j)] = slash_prefix .. command
+                _G[strconcat("SLASH_PINPIN_WAY", slash_command[1], j)] = slash_prefix .. command
             end
-            SlashCmdList["MODUSPINENS_WAY" .. slash_command[1]] = slash_command[2]
+            SlashCmdList["PINPIN_WAY" .. slash_command[1]] = slash_command[2]
         end
     end
 
     -- Set up event handlers
     do
-        moduspinens_frame:UnregisterEvent("ADDON_LOADED")
+        pinpin_frame:UnregisterEvent("ADDON_LOADED")
         local events = {
             PLAYER_LOGOUT = on_player_logout,
             MINIMAP_PING = on_minimap_ping,
@@ -1085,9 +1108,9 @@ local function on_addon_loaded()
             PLAYER_REGEN_ENABLED = on_player_regen_enabled
         }
         for event, handler in pairs(events) do
-            moduspinens_frame:RegisterEvent(event)
+            pinpin_frame:RegisterEvent(event)
         end
-        moduspinens_frame:SetScript("OnEvent", function(self, event, ...)
+        pinpin_frame:SetScript("OnEvent", function(self, event, ...)
             events[event](...)
         end)
     end
@@ -1100,7 +1123,7 @@ local function on_addon_loaded()
                 C_Map.ClearUserWaypoint()
                 C_Map.SetUserWaypoint(logout_waypoint)
                 current_waypoint.desc = saved_variables_per_character.logout_waypoint.desc
-                C_SuperTrack.SetSuperTrackedUserWaypoint(saved_variables_per_character.logout_supertrack)
+                C_SuperTrack.SetSuperTrackedUserWaypoint(saved_variables_per_character.logout_supertrack) -- the game might overwrite this when quests load in, but that's fine
             end
         end
     end
@@ -1116,25 +1139,25 @@ local function on_addon_loaded()
     -- Create an options panel
     -- !!! add ui
     -- !!! put a command reference here too
-    InterfaceOptions_AddCategory(moduspinens_frame)
+    InterfaceOptions_AddCategory(pinpin_frame)
     InterfaceAddOnsList_Update() -- fix Blizzard UI bug (otherwise OpenToCategory doesn't work on first run)
-    function moduspinens_frame:okay()
+    function pinpin_frame:okay()
         print("Okay!")
     end
-    function moduspinens_frame:cancel()
+    function pinpin_frame:cancel()
         print("Cancel :(")
     end
-    function moduspinens_frame:default()
+    function pinpin_frame:default()
         print("Default!")
     end
-    function moduspinens_frame:refresh()
+    function pinpin_frame:refresh()
         print("Refreshing!")
     end
 end
 
-moduspinens_frame:RegisterEvent("ADDON_LOADED")
-moduspinens_frame:SetScript("OnEvent", function(self, event, addon)
-    if event == "ADDON_LOADED" and addon == "ModusPinens" then
+pinpin_frame:RegisterEvent("ADDON_LOADED")
+pinpin_frame:SetScript("OnEvent", function(self, event, addon)
+    if event == "ADDON_LOADED" and addon == "PinPin" then
         on_addon_loaded()
     end
 end)
