@@ -1,4 +1,4 @@
-# Modus Pinens
+# PinPin
 
 Adds chat commands for in-game map pins that are easily shareable with other players.
 
