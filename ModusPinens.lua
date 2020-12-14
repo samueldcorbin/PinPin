@@ -372,12 +372,29 @@ local function parse_waypoint_command(msg)
     local MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW = 7
     
     if msg ~= "" then
+        -- Strip comma or period-separated coords ("8, 15" -> "8 15")
+        msg = msg:gsub("(%d)[.,] (%d)", "%1 %2")
+        -- Deal with locale differences in decimal separators
+        local wrong_sep
+        local right_sep
+        if tonumber("1.1") == nil then -- tonumber will return nil if locale doesn't use "." as decimal separator
+            right_sep = ","
+            wrong_sep = "."
+        else
+            right_sep = "."
+            wrong_sep = ","
+        end
+        local wrong_sep_pattern = strjoin("(%d)", wrong_locale_dec, "(%d)")
+        local right_step_pattern = strjoin("%1", locale_dec, "%2")
+        msg = msg:gsub(wrong_sep_pattern, right_sep_pattern)
+
+        -- Tokenize
         local tokens = {}
         for token in msg:gmatch("%S+") do
             tokens[#tokens + 1] = token
         end
         
-        -- Find first number index
+        -- Find index of first number (could be map number or the x coord)
         local first_number_pos
         local first_number
         for i, token in ipairs(tokens) do
@@ -390,12 +407,14 @@ local function parse_waypoint_command(msg)
         end
         
         if first_number then
+            -- second number could be x or y
             local second_number = tonumber(tokens[first_number_pos + 1])
-            if second_number and second_number >= 0 and second_number <= 100 then -- the second number must be either x or y
+            if second_number and second_number >= 0 and second_number <= 100 then -- second number is x or y, so we can range check it
                 -- If we don't have two consecutive numbers, the syntax is definitely wrong
+                -- if the first thing we got wasn't a number, it better be a map name
                 if first_number_pos ~= 1 then
-                    if first_number >= 0 and first_number <= 100 then
-                        -- user provided a named map
+                    -- user provided a map name
+                    if first_number >= 0 and first_number <= 100 then -- first number must be x coordinate, so range check it
                         local name_tokens = {}
                         for i = 1, first_number_pos - 1 do
                             name_tokens[#name_tokens + 1] = tokens[i]
@@ -458,7 +477,7 @@ local function parse_waypoint_command(msg)
                             for i = 1, MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW do
                                 print(matching_map_names[i]) -- !!! do better than print (can we offer clickables?)
                             end
-                            return
+                            return nil
                         elseif matching_map_ids_count > 1 then
                             -- Multiple matches
                             -- !!!print this better
@@ -473,7 +492,7 @@ local function parse_waypoint_command(msg)
                             for _, name in ipairs(matching_map_names) do
                                 print(name) -- !!! do better than print (can we offer clickables?)
                             end
-                            return
+                            return nil
                         elseif matching_map_ids_count == 0 then
                             -- do a fuzzy search and show the best guesses for the map
                             -- !!!print this better
@@ -517,7 +536,7 @@ local function parse_waypoint_command(msg)
                                     break
                                 end
                             end
-                            return
+                            return nil
                         end
                         
                         -- we have a map, x, and y
@@ -537,26 +556,27 @@ local function parse_waypoint_command(msg)
                             desc_tokens[#desc_tokens + 1] = tokens[i]
                         end
                         return {uiMapID = first_number, position = CreateVector2D(second_number / 100, third_number / 100), desc = strconcat(unpack(desc_tokens))}
-                    else
+                    elseif first_number >= 0 and first_number <= 100 then -- first number must be x coordinate, so range check it
                         local desc_tokens = {}
                         for i = first_number_pos + 2, #tokens do
                             desc_tokens[#desc_tokens + 1] = tokens[i]
                         end
-                        -- user entered just (x, y)
                         -- if their map is open, try pinning to map zone
                         if WorldMapFrame:IsVisible() then
                             local map = WorldMapFrame:GetMapID()
                             if C_Map.CanSetUserWaypointOnMap(map) then
                                 return {uiMapID = map, position = CreateVector2D(first_number / 100, second_number / 100), desc = strconcat(unpack(desc_tokens))}
                             end
+                        else
+                            -- pin in the zone the player is currently in
+                            return {uiMapID = C_Map.GetBestMapForUnit(PLAYER), position = CreateVector2D(first_number / 100, second_number / 100), desc = strconcat(unpack(desc_tokens))}
                         end
-                        -- pin in the zone the player is currently in
-                        return {uiMapID = C_Map.GetBestMapForUnit(PLAYER), position = CreateVector2D(first_number / 100, second_number / 100), desc = strconcat(unpack(desc_tokens))}
                     end
                 end
             end
         end
     end
+    return nil
 end
 
 -- Set a user-specified waypoint, /way [map name|map number] x y [description]
