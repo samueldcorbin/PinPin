@@ -19,6 +19,8 @@ Adds chat commands for in-game map pins that are easily shareable with other pla
   * Keep a map pin history (including across sessions)
   
   * Clear map pin on arrival
+  
+  * Etc.
 
 * Useful additional commands, like **/wayt[arget]**, which puts a map pin to your current target into chat along with their name and current health.
 
