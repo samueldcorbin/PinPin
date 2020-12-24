@@ -4,10 +4,7 @@
 -- !!! let users make lists of waypoints (make sure to only play sound once if adding a bunch of pins to the map together)
 -- !!! show coords in map (and on minimap?)
 -- !!! we CAN pin to many unpinnable maps by pinning to parent instead
---  !!!is is this reliable?
 --  !!!can we enable to pin button on the map too?
-
--- Hooks that depend on 
 
 local PLAYER = "player"
 
@@ -19,11 +16,21 @@ local saved_variables_per_character = {}
 
 local current_waypoint -- Stores the UiMapPoint of the current waypoint (plus a printable string and a custom desc) or nil if no waypoint
 
-local normalized_unique_map_name_to_id = {} -- Lowered and spaces removed for searching
+local normalized_unique_map_name_to_id = {} -- Lowered and spaces removed for searching, uses "/" for disambiguation separator internally (since there are map names with colons in them), front-end uses ":" to match other addons
 local map_id_to_unique_name = {} -- For displaying unique names
 do
-    --Create unique names for each map, disambiguating using parent maps or map IDs
-    -- Get the root map
+    -- Disambiguation is complex. It is written to be linear, fast, and in-line since it has to be done at every reload.
+    -- Do not alter without understanding. If something looks complicated, or the ordering seems strange, there's probably a reason.
+
+    -- All maps can be referenced by map ID number
+    -- If maps have a name, reference is:
+    --     map name if unique (e.g., "Duskwood")
+    --     or zone-and-ancestor if possible to construct an unambiguous one (e.g., "Nagrand:Outland")
+    --     or zone and ID (e.g., "Dalaran:212")
+    -- Special rule: if a map name is doubled, like "Orgrimmar - Orgrimmar", then it disambiguates alongside any other "Orgrimmar" maps, then becomes the canonical "Orgrimmar"
+    --     this elegantly handles several awkward cases like Orgrimmar and Dalaran - the double-name map is usually the main map the players want (e.g., "Orgrimmar - Orgrimmar" is the normal Orgrimmar, plain "Orgrimmar" is some other Orgrimmar, yet if the player does /way orgrimmar 52 35, we want them to get the map for "Orgrimmar - Orgrimmar", not the other random map)
+
+    -- Get the root map by finding the furthest ancestor of the fallback world map
     local root_map = C_Map.GetFallbackWorldMapID()
     while true do
         local parent = C_Map.GetMapInfo(root_map).parentMapID
@@ -33,98 +40,305 @@ do
             root_map = parent
         end
     end
-    -- Invert table and store duplicates
-    local map_name_to_id = {}
+
+    -- Get the map data for all child maps
     local map_data = C_Map.GetMapChildrenInfo(root_map, nil, true)
-    local dupes = {}
+
+    -- Find pinnable maps (there are some maps where API doesn't support pins, but we can pin to parent map instead)
+    -- Maps that pin to a parent have a "proxy" key with the map ID of the map we pin to instead
+    local map_id_to_data = {}
+
     for _, map in ipairs(map_data) do
-        local id = map.mapID
-        if C_Map.CanSetUserWaypointOnMap(id) then
+        map_id_to_data[map.mapID] = map
+    end
+
+    for id, map in pairs(map_id_to_data) do
+        if map.pinnable == nil then
+            local chain = {} -- if we end up having to check ancestors, we can set the whole chain at the same time
+            local parent_id = map.parentMapID
+            while true do
+                if C_Map.CanSetUserWaypointOnMap(id) then
+                    -- chain is pinnable
+                    map_id_to_data[id].pinnable = true
+                    for _, chain_id in ipairs(chain) do
+                        map_id_to_data[chain_id].pinnable = true
+                        map_id_to_data[chain_id].proxy = id
+                    end
+                    break
+                else
+                    chain[#chain + 1] = id
+                    if parent_id == 0 then
+                        -- no more parents to check, so this chain is not pinnable
+                        for _, id in ipairs(chain) do
+                            map_id_to_data[id].pinnable = false
+                        end
+                        break
+                    else
+                        -- check if we can translate coords onto the parent map
+                        local continent, world_pos = C_Map.GetWorldPosFromMapPos(id, CreateVector2D(0.5, 0.5))
+                        if continent and C_Map.GetMapPosFromWorldPos(continent, world_pos, parent_id) then
+                            -- can translate the coords to the parent map
+                            local pinnable = map_id_to_data[parent_id].pinnable
+                            if pinnable == true then
+                                -- parent map is pinnable, so this chain must be pinnable
+                                for _, id in ipairs(chain) do
+                                    map_id_to_data[id].pinnable = true
+                                    map_id_to_data[id].proxy = parent_id
+                                end
+                                break
+                            elseif pinnable == false then
+                                -- parent map isn't pinnable, so this chain is not pinnable
+                                for _, id in ipairs(chain) do
+                                    map_id_to_data[id].pinnable = false
+                                end
+                                break
+                            else
+                                -- parent map pinnability is unknown, so check next ancestor
+                                id = parent_id
+                                parent_id = C_Map.GetMapInfo(id).parentMapID
+                            end
+                        else
+                            -- we can't translate pin coords to parent map, so chain is not pinnable
+                            for _, id in ipairs(chain) do
+                                map_id_to_data[id].pinnable = false
+                            end
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- goal is to build unique_map_name_to_id and populate with only references to map IDs and disambiguated names
+    local unique_map_name_to_id = {} -- stores map id and proxy id (for maps that place pins on parent maps)
+
+    -- first pass to find duplicates
+    local is_dupe = {}
+    local dupes_map_data = {}
+    for id, map in pairs(map_id_to_data) do
+        if map.pinnable then
             local name = map.name
+            local proxy = map.proxy
+            unique_map_name_to_id[tostring(id)] = {id = id, proxy = proxy} -- all maps can be referenced by ID number
             if name and name ~= "" then
-                if map_name_to_id[name] then
-                    -- Found a duplicate
-                    if not dupes[name] then
-                        local first_id = map_name_to_id[name]
-                        dupes[name] = {{id = first_id, parent_id = first_id}} -- initialize parent_id to id
-                    end
-                    tinsert(dupes[name], {id = id, parent_id = id})
+                if is_dupe[name] then
+                    -- it's a duplicate
+                    dupes_map_data[#dupes_map_data + 1] = {name = name, id = id, proxy = proxy}
                 else
-                    -- Not a dupe
-                    map_name_to_id[name] = id
+                    -- it might be a duplicate
+                    local maybe_dupe = unique_map_name_to_id[name]
+                    if maybe_dupe then
+                        -- it's the first duplicate pair for this name
+                        is_dupe[name] = true
+                        dupes_map_data[#dupes_map_data + 1] = {name = name, id = maybe_dupe.id, proxy = maybe_dupe.proxy}
+                        dupes_map_data[#dupes_map_data + 1] = {name = name, id = id, proxy = proxy}
+                        unique_map_name_to_id[name] = nil
+                    else
+                        -- it's not a duplicate (so far)
+                        unique_map_name_to_id[name] = {id = id, proxy = proxy}
+                    end
                 end
+            end
+        end
+    end
+
+    -- Add floor names to disambiguate dupes, create inverted table for remaining dupes
+    is_dupe = {}
+    local double_names = {} -- keep track of names like "Orgrimmar - Orgrimmar"
+    local dupe_names_to_data = {}
+    for _, map in ipairs(dupes_map_data) do
+        local id = map.id
+        local proxy = map.proxy
+        local map_group = C_Map.GetMapGroupID(id)
+        local name = map.name
+        -- Get floor names
+        if map_group then
+            local floors = C_Map.GetMapGroupMembersInfo(map_group)
+            for _, floor in pairs(floors) do
+                if floor.mapID == id then
+                    name = strjoin(" - ", map.name, floor.name)
+                    if floor.name == map.name then
+                        -- It's a name like "Orgrimmar - Orgrimmar", which we handle in a special way
+                        double_names[name] = true
+                    end
+                    break
+                end
+            end
+        end
+        if is_dupe[name] then
+            -- it's a duplicate
+            tinsert(dupe_names_to_data[name], {id = id, ancestor_id = id, proxy = proxy}) -- initialize ancestor to self
+        else
+            -- it might be a duplicate
+            local maybe_dupe = unique_map_name_to_id[name]
+            if maybe_dupe then
+                -- it's the first duplicate pair for this name
+                is_dupe[name] = true
+                local maybe_dupe_id = maybe_dupe.id
+                dupe_names_to_data[name] = {
+                    {id = id, ancestor_id = id, proxy = proxy},
+                    {id = maybe_dupe_id, ancestor_id = maybe_dupe_id, proxy = maybe_dupe.proxy}
+                }
+                unique_map_name_to_id[name] = nil
             else
-                -- Doesn't have a name, so just use the ID
-                map_name_to_id[tostring(id)] = id
+                -- it's not a duplicate (so far)
+                unique_map_name_to_id[name] = {id = id, proxy = map.proxy}
             end
         end
     end
-    
-    -- Disambiguate duplicates
-    for name, maps in pairs(dupes) do
-        map_name_to_id[name] = nil -- Clear duplicates
-        repeat
-            -- Get the parent map IDs
-            for key, map in pairs(maps) do
-                local parent_id = C_Map.GetMapInfo(map.parent_id).parentMapID
-                if not parent_id or parent_id == 0 then
-                    -- No more parents available to disambiguate with, so suffix is map ID and we're done with this
-                    local id = map.id
-                    map_name_to_id[strjoin(":", name, id)] = id
-                    maps[key] = nil
-                else
-                    map.parent_id = parent_id
-                    map.suffix = C_Map.GetMapInfo(parent_id).name or ""
-                end
+
+    -- If it's a name like "Orgrimmar - Orgrimmar", and it's the only such double-name, then it ultimately gets promoted to single-name as the true "Orgrimmar"
+    local to_promote_name_to_id = {}
+    for double_name, _ in pairs(double_names) do
+        if unique_map_name_to_id[double_name] then
+            -- There was only one instance of this double-name, so we can proceed
+            local dash_pos = strfind(double_name, " - ", 1, true)
+            local single_name = strsub(double_name, 1, dash_pos - 1)
+            local old_single_name = unique_map_name_to_id[single_name]
+            if old_single_name then
+                -- there's already a single name in our list of disambiguated names, we need to disambiguate both, then promote the double-name at the end by removing its suffix
+                local old_single_name_id = old_single_name.id
+                local double_name_id_and_proxy = unique_map_name_to_id[double_name]
+                local double_name_id = double_name_id_and_proxy.id
+                dupe_names_to_data[single_name] = {
+                    {id = old_single_name_id, ancestor_id = old_single_name_id, proxy = old_single_name.proxy},
+                    {id = double_name_id, ancestor_id = double_name_id, proxy = double_name_id_and_proxy.proxy}
+                }
+                unique_map_name_to_id[single_name] = nil
+                to_promote_name_to_id[single_name] = double_name_id
+            elseif dupe_names_to_data[single_name] then
+                -- we need to add this to the dupes so the others will disambiguate, then promote at the end by removing the suffix
+                local double_name_id_and_proxy = unique_map_name_to_id[double_name]
+                local double_name_id = double_name_id_and_proxy.id
+                tinsert(dupe_names_to_data[single_name], {id = double_name_id, ancestor_id = double_name_id, proxy = double_name_id_and_proxy.proxy})
+                to_promote_name_to_id[single_name] = unique_map_name_to_id[double_name].id
+            else
+                -- we can promote the double-name right now
+                unique_map_name_to_id[single_name] = unique_map_name_to_id[double_name]
+                -- we don't need to do anything later
             end
-            -- Find duplicate parent IDs among the duplicate map IDs (since this means all further ancestors will be shared too)
-            local parent_ids_to_maps = {}
-            for key, map in pairs(maps) do
-                local parent_id = map.parent_id
-                if not parent_ids_to_maps[parent_id] then
-                    parent_ids_to_maps[parent_id] = {}
-                end
-                tinsert(parent_ids_to_maps[parent_id], {key = key, map = map})
-            end
-            for parent_id, child_maps in pairs(parent_ids_to_maps) do
-                if #child_maps > 1 then
-                    -- Duplicate parent IDs, so suffix is map ID and we're done with these
-                    for child_map_key, child_map in ipairs(child_maps) do
-                        local id = child_map.map.id
-                        map_name_to_id[strjoin(":", name, id)] = id
-                        maps[child_map.key] = nil
+            unique_map_name_to_id[double_name] = nil
+        end
+    end
+
+    -- Try to disambiguate with other information
+    for name, maps in pairs(dupe_names_to_data) do
+        -- If multiple maps have the same proxy and same coordinate system, we can just use the same name for all (since that means we'll just be pinning to the same map anyway)
+        -- (There might not be any such maps, but there may be some added later)
+        do
+            local first_map = maps[1]
+            local id = first_map.id
+            local proxy = first_map.proxy
+            local found_unmatched = false
+            if proxy then
+                local _, world_pos_one, world_pos_two
+                -- if two points on both maps project to the same world coords, the maps share the same space
+                _, world_pos_one = C_Map.GetWorldPosFromMapPos(id, CreateVector2D(0.25, 0.25))
+                _, world_pos_two = C_Map.GetWorldPosFromMapPos(id, CreateVector2D(0.75, 0.75))
+                -- see if the two points match on the other maps:
+                for i = 2, #maps do
+                    if maps[i].proxy == proxy then
+                        local test_world_pos_one, test_world_pos_two
+                        _, test_world_pos_one = C_Map.GetWorldPosFromMapPos(id, CreateVector2D(0.25, 0.25))
+                        _, test_world_pos_two = C_Map.GetWorldPosFromMapPos(id, CreateVector2D(0.75, 0.75))
+                        if test_world_pos_one.x ~= world_pos_one.x or test_world_pos_one.y ~= world_pos_one.y or test_world_pos_two.x ~= world_pos_two.x or test_world_pos_two.y ~= world_pos_two.y then
+                            found_unmatched = true
+                            break
+                        end
+                    else
+                        found_unmatched = true
+                        break
                     end
                 end
-            end
-            -- Find remaining duplicate suffixes
-            local suffixes_to_maps = {}
-            for key, map in pairs(maps) do
-                local suffix = map.suffix
-                if not suffixes_to_maps[suffix] then
-                    suffixes_to_maps[suffix] = {}
-                end
-                tinsert(suffixes_to_maps[suffix], {key = key, map = map})
-            end
-            local found_dupe = false
-            for suffix, suffixed_maps in pairs(suffixes_to_maps) do
-                if #suffixed_maps == 1 and suffix ~= "" then
-                    -- Suffix is unique and non-empty
-                    local unique_map_entry = suffixed_maps[1]
-                    map_name_to_id[strjoin(":", name, suffix)] = unique_map_entry.map.id
-                    maps[unique_map_entry.key] = nil
-                else
-                    found_dupe = true
+                if not found_unmatched then
+                    unique_map_name_to_id[name] = {id = id, proxy = proxy}
                 end
             end
-        until not found_dupe
-    end
-    
-    -- Build the outputs for searching and displaying
-    for name, id in pairs(map_name_to_id) do
-        if not tonumber(name) then
-            normalized_unique_map_name_to_id[strlower(gsub(name, "%s+", ""))] = id
         end
-        map_id_to_unique_name[id] = name
+        if not proxy or found_unmatched then
+            -- See if we can use ancestor maps to disambiguate (e.g., Nagrand:Outland)
+            repeat
+                -- Get the next ancestor map IDs
+                for key, map in pairs(maps) do -- maps may have holes in it
+                    local parent_id = C_Map.GetMapInfo(map.ancestor_id).parentMapID
+                    if parent_id == 0 then
+                        -- No more parents available to disambiguate with, so best suffix is map ID
+                        local id = map.id
+                        if to_promote_name_to_id[name] == id then
+                            unique_map_name_to_id[name] = {id = id, proxy = map.proxy}
+                        else
+                            unique_map_name_to_id[strjoin("/", name, id)] = {id = id, proxy = map.proxy}
+                        end
+                        maps[key] = nil
+                    else
+                        map.ancestor_id = parent_id
+                    end
+                end
+                -- Find duplicate ancestor IDs among the duplicate map names (since this means all further ancestors will be shared too)
+                local ancestor_ids_to_maps = {}
+                for key, map in pairs(maps) do
+                    local ancestor_id = map.ancestor_id
+                    if not ancestor_ids_to_maps[ancestor_id] then
+                        ancestor_ids_to_maps[ancestor_id] = {}
+                    end
+                    tinsert(ancestor_ids_to_maps[ancestor_id], {key = key, map = map}) -- save the key so we can nil it in maps if there are duplicate ancestors
+                end
+                for ancestor_id, child_maps in pairs(ancestor_ids_to_maps) do
+                    if #child_maps > 1 then
+                        -- Found duplicate ancestor IDs, so best suffix is map ID
+                        for child_map_key, child_map in ipairs(child_maps) do
+                            local id = child_map.map.id
+                            if to_promote_name_to_id[name] == id then
+                                unique_map_name_to_id[name] = {id = id, proxy = child_map.map.proxy}
+                            else
+                                unique_map_name_to_id[strjoin("/", name, id)] = {id = id, proxy = child_map.map.proxy}
+                            end
+                            maps[child_map.key] = nil
+                        end
+                    end
+                end
+                -- Find remaining duplicate suffixes
+                local suffixes_to_maps = {}
+                for key, map in pairs(maps) do
+                    local suffix = C_Map.GetMapInfo(map.ancestor_id).name
+                    if suffix then
+                        map.suffix = suffix
+                        if not suffixes_to_maps[suffix] then
+                            suffixes_to_maps[suffix] = {}
+                        end
+                        tinsert(suffixes_to_maps[suffix], {key = key, map = map})
+                    end
+                end
+                local found_dupe = false
+                for suffix, suffixed_maps in pairs(suffixes_to_maps) do
+                    if #suffixed_maps == 1 then
+                        -- Suffix is unique
+                        local unique_map_entry = suffixed_maps[1]
+                        if to_promote_name_to_id[name] == unique_map_entry.map.id then
+                            unique_map_name_to_id[name] = {id = unique_map_entry.map.id, proxy = unique_map_entry.map.proxy}
+                        else
+                            unique_map_name_to_id[strjoin("/", name, suffix)] = {id = unique_map_entry.map.id, proxy = unique_map_entry.map.proxy}
+                        end
+                        maps[unique_map_entry.key] = nil
+                    else
+                        found_dupe = true
+                    end
+                end
+            until not found_dupe
+        end
+    end
+
+    -- Build the outputs for searching and displaying
+    for name, id_and_proxy in pairs(unique_map_name_to_id) do
+        normalized_unique_map_name_to_id[strlower(gsub(name, "%s+", ""))] = id_and_proxy
+
+        -- Get the shortest, non-numeric (if possible) name for the map
+        local id = id_and_proxy.id
+        local map_id_to_unique_name_entry = map_id_to_unique_name[id]
+        if map_id_to_unique_name_entry == nil or tonumber(map_id_to_unique_name_entry) then
+            map_id_to_unique_name[id] = gsub(name, "/", ":") -- front-end uses ":" as separator
+        end
     end
 end
 
@@ -376,10 +590,11 @@ local function parse_waypoint_command(msg)
     if msg ~= "" then
         -- Strip comma or period-separated coords ("8, 15" -> "8 15")
         msg = msg:gsub("(%d)[.,] (%d)", "%1 %2")
+
         -- Deal with locale differences in decimal separators
         local wrong_sep
         local right_sep
-        if tonumber("1.1") == nil then -- tonumber will return nil if locale doesn't use "." as decimal separator
+        if tonumber("1.1") == nil then -- this tonumber will return nil if locale doesn't use "." as decimal separator
             right_sep = ","
             wrong_sep = "."
         else
@@ -409,55 +624,45 @@ local function parse_waypoint_command(msg)
         end
         
         if first_number then
-            -- second number could be x or y
-            local second_number = tonumber(tokens[first_number_pos + 1])
+            local second_number = tonumber(tokens[first_number_pos + 1]) -- second_number could be x or y
             if second_number and second_number >= 0 and second_number <= 100 then -- second number is x or y, so we can range check it
                 -- If we don't have two consecutive numbers, the syntax is definitely wrong
-                -- if the first thing we got wasn't a number, it better be a map name
-                if first_number_pos ~= 1 then
+                if first_number_pos ~= 1 then -- if the first thing we got wasn't a number, it better be a map name
                     -- user provided a map name
                     if first_number >= 0 and first_number <= 100 then -- first number must be x coordinate, so range check it
                         local name_tokens = {}
                         for i = 1, first_number_pos - 1 do
                             name_tokens[#name_tokens + 1] = tokens[i]
                         end
-                        local map_name = strlower(strconcat(unpack(name_tokens)))
-                        local map_name_colon = strfind(map_name, ":", 1, true)
+                        local input_name = strlower(strconcat(unpack(name_tokens)))
                         
                         -- find matching names in the DB
                         local matching_map_ids = {}
-                        local db_probe = normalized_unique_map_name_to_id[map_name]
+                        local db_probe = normalized_unique_map_name_to_id[input_name]
                         if db_probe then
                             -- exact match
                             matching_map_ids = {db_probe}
                         else
                             -- partial matching
-                            if map_name_colon then
-                                for db_name, db_map_id in pairs(normalized_unique_map_name_to_id) do
-                                    if strfind(db_name, map_name, 1, true) then
-                                        matching_map_ids[#matching_map_ids + 1] = db_map_id
-                                    end
+                            -- first try only prefixes (don't match "Greymane Manor:Ruins of Gilneas" on the input "Gilneas")
+                            for db_name, db_map_id in pairs(normalized_unique_map_name_to_id) do
+                                local db_name_sep = strfind(db_name, "/", 1, true)
+                                local prefix
+                                if db_name_sep then
+                                    prefix = strsub(db_name, 1, db_name_sep - 1)
+                                else
+                                    prefix = db_name
                                 end
-                            else
-                                -- if no colon in input, first try only prefixes (don't match "Greymane Manor:Ruins of Gilneas" on the input "Gilneas")
-                                for db_name, db_map_id in pairs(normalized_unique_map_name_to_id) do
-                                    local db_name_colon = strfind(db_name, ":", 1, true)
-                                    local prefix
-                                    if db_name_colon then
-                                        prefix = strsub(db_name, 1, db_name_colon - 1)
-                                    else
-                                        prefix = db_name
-                                    end
-                                    if strfind(prefix, map_name, 1, true) then
-                                        matching_map_ids[#matching_map_ids + 1] = db_map_id
-                                    end
+
+                                if strfind(prefix, input_name, 1, true) then
+                                    matching_map_ids[#matching_map_ids + 1] = db_map_id
                                 end
-                                -- if we didn't find anything, try suffixes too
-                                if #matching_map_ids == 0 then
-                                    for db_name, db_map_id in pairs(normalized_unique_map_name_to_id) do
-                                        if strfind(db_name, map_name, 1, true) then
-                                            matching_map_ids[#matching_map_ids + 1] = db_map_id
-                                        end
+                            end
+                            -- if we didn't find anything, try suffixes too
+                            if #matching_map_ids == 0 then
+                                for db_name, db_map_id in pairs(normalized_unique_map_name_to_id) do
+                                    if strfind(gsub(db_name, "/", ":"), input_name, 1, true) then -- front-end separators are ":"
+                                        matching_map_ids[#matching_map_ids + 1] = db_map_id
                                     end
                                 end
                             end
@@ -470,8 +675,8 @@ local function parse_waypoint_command(msg)
                             -- !!! print this better
                             print(matching_map_ids_count .. " possible matches for zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Top results:")
                             local matching_map_names = {}
-                            for _, id in ipairs(matching_map_ids) do
-                                matching_map_names[#matching_map_names + 1] = map_id_to_unique_name[id]
+                            for _, id_and_proxy in ipairs(matching_map_ids) do
+                                matching_map_names[#matching_map_names + 1] = map_id_to_unique_name[id_and_proxy.id]
                             end
                             sort(matching_map_names, function (a, b)
                                 return #a < #b
@@ -485,8 +690,8 @@ local function parse_waypoint_command(msg)
                             -- !!!print this better
                             print(matching_map_ids_count .. " possible matches for zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Did you mean:")
                             local matching_map_names = {}
-                            for _, id in ipairs(matching_map_ids) do
-                                matching_map_names[#matching_map_names + 1] = map_id_to_unique_name[id]
+                            for _, id_and_proxy in ipairs(matching_map_ids) do
+                                matching_map_names[#matching_map_names + 1] = map_id_to_unique_name[id_and_proxy.id]
                             end
                             sort(matching_map_names, function (a, b)
                                 return #a < #b
@@ -500,39 +705,50 @@ local function parse_waypoint_command(msg)
                             -- !!!print this better
                             print("Couldn't find zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Did you mean:")
                             local fuzzy_matching_map_names = {}
-                            if map_name_colon then
-                                for name, id in pairs(normalized_unique_map_name_to_id) do
-                                    fuzzy_matching_map_names[#fuzzy_matching_map_names + 1] = {name, CalculateStringEditDistance(name, map_name)}
-                                end
-                            else
-                                -- if search string doesn't have colon then only match on prefixes
-                                for name, id in pairs(normalized_unique_map_name_to_id) do
-                                    local name_colon = strfind(name, ":", 1, true)
-                                    local prefix
-                                    if name_colon then
-                                        prefix = strsub(name, 1, name_colon - 1)
-                                    else
-                                        prefix = name
+                            for name, _ in pairs(normalized_unique_map_name_to_id) do
+                                -- get base edit distance
+                                local edit_distance = CalculateStringEditDistance(gsub(name, "/", ":"), input_name)
+
+                                -- see if prefix has better edit distance
+                                local prefix_sep = strfind(name, "/", 1, true)
+                                local prefix
+                                if prefix_sep then
+                                    prefix = strsub(name, 1, prefix_sep - 1)
+                                    local prefix_edit_distance = CalculateStringEditDistance(prefix, input_name)
+                                    if prefix_edit_distance < edit_distance then
+                                        edit_distance = prefix_edit_distance
                                     end
-                                    fuzzy_matching_map_names[#fuzzy_matching_map_names + 1] = {name, CalculateStringEditDistance(prefix, map_name)}
+                                else
+                                    -- the name has no disambiguation - it is just a prefix (but we've already checked it)
+                                    prefix = name
                                 end
+                                -- see if sub-parts of the prefix have better edit distance (otherwise fuzzy match, e.g., "Oriboo" will be too far from "Oribos - Ring of Fates")
+                                for sub_prefix in gmatch(prefix, "(.-)%p") do
+                                    local sub_prefix_edit_distance = CalculateStringEditDistance(sub_prefix, input_name)
+                                    if sub_prefix_edit_distance < edit_distance then
+                                        edit_distance = sub_prefix_edit_distance
+                                    end
+                                end
+                                fuzzy_matching_map_names[#fuzzy_matching_map_names + 1] = {name, edit_distance}
                             end
+
+                            -- Sort by edit distance
                             sort(fuzzy_matching_map_names, function (a,b)
                                 return a[2] < b[2]
                             end)
-                            
+
                             -- Remove fuzzy matches that are totally unrelated to input string
-                            local map_name_length = #map_name
+                            local input_name_length = #input_name
                             for i, name in ipairs(fuzzy_matching_map_names) do
-                                if name[2] == max(map_name_length, #name[1]) then
+                                if name[2] == max(input_name_length, #name[1]) then
                                     fuzzy_matching_map_names[i] = nil
                                 end
                             end
-                            
+
                             -- Print the fuzzy matches
                             local shown = 0
                             for _, name in pairs(fuzzy_matching_map_names) do
-                                print(map_id_to_unique_name[normalized_unique_map_name_to_id[name[1]]]) -- !!! do better than print
+                                print(map_id_to_unique_name[normalized_unique_map_name_to_id[name[1]].id]) -- !!! do better than print
                                 shown = shown + 1
                                 if shown == MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW then
                                     break
@@ -578,23 +794,6 @@ local function parse_waypoint_command(msg)
         end
     end
     return nil
-end
-
-tester = function ()
-    scroll_container = WorldMapFrame.ScrollContainer
-    local x, y = scroll_container:NormalizeUIPosition(scroll_container:GetCursorPosition())
-    print(x, y)
-    local pos = CreateVector2D(x, y) -- map pos are 0-1
-    local map = C_Map.GetBestMapForUnit(PLAYER)
-    print(map)
-    local parent_map = C_Map.GetMapInfo(map).parentMapID
-    print(parent_map)
-    local continent, world_pos = C_Map.GetWorldPosFromMapPos(map, pos)
-    print(continent, world_pos.x, world_pos.y) -- world pos are huge numbers
-    local return_map, parent_pos = C_Map.GetMapPosFromWorldPos(continent, world_pos, parent_map) -- first return is same as parent_map, returns nil for dungeons
-    print(return_map, parent_pos.x, parent_pos.y)
-    local map_point = UiMapPoint.CreateFromVector2D(parent_map, parent_pos)
-    C_Map.SetUserWaypoint(map_point)
 end
 
 -- Set a user-specified waypoint, /way [map name|map number] x y [description]
@@ -1009,7 +1208,7 @@ local function on_addon_loaded()
     -- Add hooks that depend on options
     -- Clear active pin when user comes within user-defined distance
     hooksecurefunc(SuperTrackedFrame, "UpdateDistanceText", function ()
-        if saved_variables.automatic_clear and C_Navigation.GetDistance() <= saved_variables.clear_distance then
+        if saved_variables.automatic_clear and not UnitOnTaxi(PLAYER) and C_Navigation.GetDistance() <= saved_variables.clear_distance then
             clear_waypoint()
         end
     end)
@@ -1018,7 +1217,9 @@ local function on_addon_loaded()
     do
         local function update_waypoint_tooltip()
             GameTooltip_SetTitle(GameTooltip, current_waypoint.desc or "Map Pin", NORMAL_FONT_COLOR)
-            GameTooltip_AddColoredLine(GameTooltip, format("%d |4yard:yards away", floor(C_Navigation.GetDistance())), WHITE_FONT_COLOR)
+            if not UnitOnTaxi(PLAYER) then
+                GameTooltip_AddColoredLine(GameTooltip, format("%d |4yard:yards away", floor(C_Navigation.GetDistance())), WHITE_FONT_COLOR)
+            end
             GameTooltip_AddColoredLine(GameTooltip, current_waypoint.string, LIGHTGRAY_FONT_COLOR)
             GameTooltip_AddInstructionLine(GameTooltip, "<Shift-Click to share pin in chat>")
             GameTooltip_AddInstructionLine(GameTooltip, MAP_PIN_REMOVE)
