@@ -2,7 +2,7 @@
 ## Author: samueldcorbin
 ## Title: PinPin
 ## Version: 1.0.0
-## Notes: Adds pin-related chat commands.
+## Notes: Extends map pin functionality and adds pin-related chat commands.
 ## SavedVariables: PinPinSavedVariables
 ## SavedVariablesPerCharacter: PinPinSavedVariablesPerCharacter
 PinPin.lua
