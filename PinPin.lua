@@ -15,7 +15,7 @@ local saved_variables_per_character = {}
 --     string (a user-readable string with map name and coords)
 --     proxy_for (this waypoint isn't actually pinned to the map it appears to be, but rather a parent map, which is stored as proxy_for)
 --     requires_pinpin (for pins to maps that don't allow them and can't be proxied - can't be supertracked or shared with non-PinPin users)
-local current_waypoint -- Stores the UiMapPoint of the current waypoint (plus a printable string and a custom desc) or nil if no waypoint
+local current_waypoint
 
 -- Map Names
 --     All maps can be referenced by map ID number
@@ -32,7 +32,7 @@ local current_waypoint -- Stores the UiMapPoint of the current waypoint (plus a 
 
 local normalized_map_name_to_id = {} -- Case-lowered and spaces normalized for searching, uses ASCII 3 for disambiguation separator internally (since there are map names with colons in them), front-end uses ":" to match other addons
 local map_id_to_unique_name = {} -- For displaying unique names; uses ":" as disambiguation separator to match other addons
-local map_id_to_data -- Function for looking up map data, resolves and caches unenumerated maps that are looked up after initial enumeration
+local map_id_to_data -- resolves and caches additional unenumerated maps that are looked up after initial enumeration
 
 local MAP_SUFFIX_SEP = string.char(3) -- this should be a safe value that is never included in the game's actual map names
 
@@ -52,50 +52,11 @@ do
     -- Get the map info for all descendent maps (recursive)
     local map_info = C_Map.GetMapChildrenInfo(root_map_id, nil, true)
 
-    --[[
-    -- verify that recursive C_Map.GetMapChildrenInfo returns in a top-down order (child map never precedes parent map)
-    local function build_map_tree(node)
-        local children = C_Map.GetMapChildrenInfo(node.mapID)
-        if #children > 0 then
-            node.children = children
-            for _, child in ipairs(children) do
-                build_map_tree(child)
-            end
-        end
-    end
-
-    local map_tree = C_Map.GetMapInfo(root_map_id)
-    build_map_tree(map_tree)
-
-    local function search_tree(id, node, parent)
-        if node.mapID == id then
-            return node, parent
-        else
-            if node.children then
-                for _, child in ipairs(node.children) do
-                    local target_node, parent = search_tree(id, child, node)
-                    if target_node then
-                        return target_node, parent
-                    end
-                end
-            end
-        end
-    end
-
-    search_tree(root_map_id, map_tree).visited = true
-    for _, map in pairs(map_info) do
-        local node, parent = search_tree(map.mapID, map_tree)
-        assert(parent.visited, "C_Map.GetMapChildrenInfo isn't returning in top-down order anymore")
-        node.visited = true
-    end
-    --]]
-
     -- Primary goal is now to build map_name_to_id, associating map ID and a unique name with each map's data; and _map_id_to_data, telling PinPin how to handle each map
     local map_name_to_id = {}
     local no_name_maps = {} -- a few maps have no names at all; will have to use ID for display name
     local _map_id_to_data = {}
 
-    -- Add root map first
     local root_map_data = {}
     if not C_Map.CanSetUserWaypointOnMap(root_map_id) then
         root_map_data.requires_pinpin = true -- pins to this map won't display for non-PinPin users
@@ -126,14 +87,12 @@ do
             if instance_id then
                 -- check to see if parent can serve as proxy
                 local parent_id = map.parentMapID
-                local parent = _map_id_to_data[parent_id] -- this is safe because recursive map_info is in top-down order, so we've already handled the parent map
+                local parent = _map_id_to_data[parent_id]
                 if parent.requires_pinpin then
-                    -- if the parent already requires PinPin, it isn't useful as a proxy
                     requires_pinpin = true
                 else
                     local parent_instance_id = C_Map.GetWorldPosFromMapPos(parent_id, test_vector)
                     if instance_id ~= parent_instance_id then
-                        -- map and parent aren't in same instance, so we can't project coords
                         requires_pinpin = true
                     else
                         if parent.proxy then
@@ -144,7 +103,6 @@ do
                     end
                 end
             else
-                -- Some maps can't translate map coords to world coords at all
                 requires_pinpin = true
             end
         end
@@ -166,7 +124,6 @@ do
     end
     map_info = nil
 
-    -- Move map_name_to_id entries that had dupes into the dupes
     for name in next, dupe_names do
         dupes[#dupes + 1] = {name = name, id = map_name_to_id[name]}
         map_name_to_id[name] = nil
@@ -193,13 +150,12 @@ do
         local test_vector_one = CreateVector2D(0.25, 0.25)
         local test_vector_two = CreateVector2D(0.75, 0.75)
         for name, ids in next, dupes_name_to_ids do
-            local pin_to_map -- which of the maps we should pin to if this works
-            local native_pin -- doesn't require PinPin or have a proxy
-            local requires_pinpin, requires_proxy
+            local pin_to_map
+            local native_pin, requires_pinpin, requires_proxy
 
             local probe_id = ids[1]
             local probe_data = _map_id_to_data[probe_id]
-            pin_to_map = probe_id
+            pin_to_this_map = probe_id
             requires_pinpin = probe_data.requires_pinpin
             requires_proxy = probe_data.proxy ~= nil
             native_pin = not requires_proxy and not requires_pinpin
@@ -208,7 +164,6 @@ do
             local instance, world_pos_one = C_Map.GetWorldPosFromMapPos(probe_id, test_vector_one)
             if instance then
                 local _, world_pos_two = C_Map.GetWorldPosFromMapPos(probe_id, test_vector_two)
-                -- see if the two points match on the other maps:
                 for i = 2, #ids do
                     local test_id = ids[i]
                     local test_instance, test_world_pos_one = C_Map.GetWorldPosFromMapPos(test_id, test_vector_one)
@@ -223,23 +178,20 @@ do
                     end
 
                     if not native_pin then
-                        -- we haven't yet found a map we can pin to natively
                         local test_data = _map_id_to_data[test_id]
                         if requires_pinpin and not test_data.requires_pinpin then
-                            -- if this map doesn't require pinpin, then use it instead
-                            pin_to_map = test_id
+                            pin_to_this_map = test_id
                             requires_pinpin = false
                             requires_proxy = test_data.proxy ~= nil
                             native_pin = not requires_proxy
                         elseif not test_data.proxy then
-                            -- if this map doesn't require a proxy, then use it instead
-                            pin_to_map = test_id
+                            pin_to_this_map = test_id
                             native_pin = true
                         end
                     end
                 end
                 if not found_unmatched then
-                    map_name_to_id[name] = pin_to_map
+                    map_name_to_id[name] = pin_to_this_map
                     dupes_name_to_ids[name] = nil
                 end
             end
@@ -260,14 +212,12 @@ do
                 for j = 1, #floors do
                     local floor = floors[j]
                     if floor.mapID == id then
-                        -- This is the floor associated with the map
                         local floor_name = floor.name
                         got_floor_name = floor_name ~= nil and floor_name ~= ""
 
                         if floor_name == name then
                             -- unique double names like "Orgrimmar - Orgrimmar" get promoted to single-name as the true "Orgrimmar"
                             if double_name_map then
-                                -- we already found at least one double-name map
                                 if double_name_unique then
                                     double_name_unique = false
                                     local name_with_floor = strjoin(" - ", name, floor_name)
@@ -286,7 +236,6 @@ do
                                     new_dupes_name_to_ids[name_with_floor] = {id}
                                 end
                             else
-                                -- this is the first double-name map we've found
                                 double_name_map = id
                                 double_name_unique = true
                             end
@@ -313,7 +262,6 @@ do
             map_name_to_id[name] = double_name_map
         end
 
-        -- Replace ids node with new_ids
         local num_new_ids = #new_ids
         if num_new_ids == 1 and not double_name_unique then
             -- map was retroactively disambiguated by all other ambiguous maps gaining floor names
@@ -325,7 +273,6 @@ do
             dupes_name_to_ids[name] = nil
         end
     end
-    -- Identify newly created singletons; add new non-singletons to dupes_name_to_ids
     for name, ids in next, new_dupes_name_to_ids do
         if #ids == 1 then
             map_name_to_id[name] = ids[1]
@@ -341,7 +288,7 @@ do
         if not map_name_to_id[name] then
             -- there isn't already a promoted double-name, so we can try to promote based on map_type
             local map_type_to_ids = {}
-            local smallest_map_type = math.huge -- smallest number is the most cosmic map type
+            local smallest_map_type = math.huge -- smallest map_type is the most cosmic map type
             for i = 1, #ids do
                 local id = ids[i]
                 local map_type = C_Map.GetMapInfo(id).mapType
@@ -389,7 +336,6 @@ do
 
         for parent_name, ids in next, parent_name_to_ids do
             if #ids == 1 then
-                -- parent map is potentially disambiguating
                 local id = ids[1]
                 local parent = C_Map.GetMapInfo(id).parentMapID
                 local promoted_map = map_name_to_id[name] -- check if we've already promoted something to become canonical for this name
@@ -408,13 +354,13 @@ do
         end
     end
 
-    -- Build the outputs for searching and displaying
+    -- Build outputs for searching and displaying
     for name, id in next, map_name_to_id do
         normalized_map_name_to_id[strlower(gsub(name, "%s+", " "))] = id
         map_id_to_unique_name[id] = gsub(name, MAP_SUFFIX_SEP, ":", 1)
     end
 
-    -- Maps with no name use their map id instead
+    -- Maps with no name use map id instead
     for i = 1, #no_name_maps do
         local id = no_name_maps[i]
         map_id_to_unique_name[id] = tostring(id)
@@ -436,28 +382,22 @@ do
         _map_id_to_data[id] = {id = id}
         local data = _map_id_to_data
         if not C_Map.CanSetUserWaypointOnMap(id) then
-            -- it can't be pinned directly, so either it can pin to a proxy or it requires PinPin
             local instance_id = C_Map.GetWorldPosFromMapPos(id, test_vector)
             if not instance_id then
-                -- Some maps can't translate map coords to world coords at all
                 data.requires_pinpin = true
             else
-                -- search ancestors for a viable proxy
                 local parent_id = C_Map.GetMapInfo(id).parentMapID
                 while parent_id ~= 0 do
-                    local parent_data = _map_id_to_data[parent_id] -- if this isn't nil, we've ascended the map tree into a branch we've enumerated, so no more need to recursion
+                    local parent_data = _map_id_to_data[parent_id]
                     if parent_data and parent_data.requires_pinpin then
-                        -- if the parent already requires PinPin, there won't be a proxy
                         data.requires_pinpin = true
                         break
                     end
                     local parent_instance_id = C_Map.GetWorldPosFromMapPos(parent_id, test_vector)
                     if instance_id ~= parent_instance_id then
-                        -- map and parent aren't in same instance, so we can't project coords to a proxy
                         data.requires_pinpin = true
                         break
                     elseif parent_data then
-                        -- we've ascended the map tree into a branch we've enumerated, and it's not requires_pinpin, so we have our proxy
                         if parent_data.proxy then
                             data.proxy = parent_data.proxy
                         else
@@ -528,12 +468,11 @@ local function is_pin_visible_on_open_map()
     return x >= 0 and x <= 1 and y >= 0 and y <=1
 end
 
--- Track the last 100 waypoints we've set
 -- TODO: Add commands for accessing history
 -- TODO: Can history display provide clickable pins?
 local waypoint_history_add, waypoint_history_last, waypoint_history_save, waypoint_history_restore
 do
-    -- implemented as an array with a wrap-around index
+    -- history is an array with a wrap-around index
     local HISTORY_SIZE = 100
     local history = {}
     local index = 0
@@ -553,10 +492,8 @@ do
     function waypoint_history_save()
         if index ~= 0 then
             if #history < HISTORY_SIZE then
-                -- saved history isn't full
                 return history
             else
-                -- saved history is full
                 local waypoints = {}
                 for i = 0, HISTORY_SIZE - 1 do
                     local read_index = (index + i) % HISTORY_SIZE + 1
@@ -577,7 +514,7 @@ end
 
 -- e.g., given 1.31, 1.2, returns 2 because .31 goes to 2 decimal places (and that's more places than .2)
 -- so we can, e.g., print "1.31, 1.20" rather than "1.31, 1.2"
-local function longest_fractional_part(...)
+local function longest_fractional_part_length(...)
     local nums = {...}
     local places = 0
     for _, num in ipairs(nums) do
@@ -594,10 +531,8 @@ local function get_waypoint_display_strings(waypoint)
 
     local x = waypoint.position.x * 100
     local y = waypoint.position.y * 100
-    local places = longest_fractional_part(x, y)
-    if places > MAX_DECIMAL_PLACES then
-        places = MAX_DECIMAL_PLACES
-    end
+    local places = longest_fractional_part_length(x, y)
+    places = min(places, MAX_DECIMAL_PLACES)
     local format_string = strconcat("%.", places, "f")
     return map_id_to_unique_name[waypoint.uiMapID], format(format_string, x), format(format_string, y)
 end
@@ -654,7 +589,6 @@ local function set_waypoint(map, position, desc)
     end
 
     set_current_waypoint_string()
-
     if desc then
         current_waypoint.desc = strtrim(desc)
     end
@@ -690,13 +624,12 @@ local function parse_waypoint_command(msg)
         local right_sep_pattern = strconcat("%1", right_sep, "%2")
         msg = msg:gsub(wrong_sep_pattern, right_sep_pattern, 1)
 
-        -- Tokenize
         local tokens = {}
         for token in gmatch(msg, "%S+") do
             tokens[#tokens + 1] = token
         end
 
-        -- Find index of first number (could be map number or the x coord)
+        -- first number could be map number or the x coord
         local first_number_pos
         local first_number
         for i, token in ipairs(tokens) do
@@ -708,169 +641,158 @@ local function parse_waypoint_command(msg)
             end
         end
 
-        if first_number then
-            local second_number = tonumber(tokens[first_number_pos + 1]) -- second_number could be x or y
-            if second_number and second_number >= 0 and second_number <= 100 then -- second number is x or y, so we can range check it
-                -- If we don't have two consecutive numbers, the syntax is definitely wrong
-                if first_number_pos ~= 1 then -- if the first thing we got wasn't a number, it better be a map name
-                    -- user provided a map name
-                    if first_number >= 0 and first_number <= 100 then -- first number must be x coordinate, so range check it
-                        local name_tokens = {}
-                        for i = 1, first_number_pos - 1 do
-                            name_tokens[#name_tokens + 1] = tokens[i]
-                        end
-                        local input_name = strlower(strjoin(" ", unpack(name_tokens)))
+        if not first_number then
+            return nil
+        end
 
-                        -- find matching names in the DB
-                        local matching_map_ids = {}
-                        local db_probe = normalized_map_name_to_id[input_name]
-                        if db_probe then
-                            -- exact match
-                            matching_map_ids = {db_probe}
-                        else
-                            -- partial matching
-                            -- first try only prefixes (don't match "Greymane Manor:Ruins of Gilneas" on the input "Gilneas")
-                            for db_name, db_map_id in pairs(normalized_map_name_to_id) do
-                                local db_name_sep = strfind(db_name, MAP_SUFFIX_SEP, 1, true)
-                                local prefix
-                                if db_name_sep then
-                                    prefix = strsub(db_name, 1, db_name_sep - 1)
-                                else
-                                    prefix = db_name
-                                end
+        local second_number = tonumber(tokens[first_number_pos + 1]) -- second_number is x or y
+        if not second_number or second_number < 0 or second_number > 100 then
+            return nil
+        end
 
-                                if strfind(prefix, input_name, 1, true) then
-                                    matching_map_ids[#matching_map_ids + 1] = db_map_id
-                                end
-                            end
-                            -- if we didn't find anything, try suffixes too
-                            if #matching_map_ids == 0 then
-                                for db_name, db_map_id in pairs(normalized_map_name_to_id) do
-                                    if strfind(gsub(db_name, MAP_SUFFIX_SEP, ":", 1), input_name, 1, true) then -- front-end separators are ":"
-                                        matching_map_ids[#matching_map_ids + 1] = db_map_id
-                                    end
-                                end
-                            end
-                        end
+        if first_number_pos ~= 1 then
+            -- user provided (map name, x, y)
 
-                        -- Handle bad/ambiguous map inputs
-                        local matching_map_ids_count = #matching_map_ids
-                        if matching_map_ids_count > MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW then
-                            -- Too many matches
-                            print(matching_map_ids_count .. " possible matches for zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Top results:")
-                            local matching_map_names = {}
-                            for _, id in ipairs(matching_map_ids) do
-                                matching_map_names[#matching_map_names + 1] = map_id_to_unique_name[id]
-                            end
-                            sort(matching_map_names,
-                                 function (a, b)
-                                     return #a < #b
-                                 end
-                            )
-                            for i = 1, MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW do
-                                print(matching_map_names[i]) -- TODO: can we offer clickables?
-                            end
-                            return nil
-                        elseif matching_map_ids_count > 1 then
-                            -- Multiple matches
-                            print(matching_map_ids_count .. " possible matches for zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Did you mean:")
-                            local matching_map_names = {}
-                            for _, id in ipairs(matching_map_ids) do
-                                matching_map_names[#matching_map_names + 1] = map_id_to_unique_name[id]
-                            end
-                            sort(matching_map_names,
-                                 function (a, b)
-                                     return #a < #b
-                                 end
-                            )
-                            for _, name in ipairs(matching_map_names) do
-                                print(name) -- TODO: can we offer clickables?
-                            end
-                            return nil
-                        elseif matching_map_ids_count == 0 then
-                            -- do a fuzzy search and show the best guesses for the map
-                            print("Couldn't find zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Did you mean:")
-                            local fuzzy_matching_map_names = {}
-                            local input_name_length = #input_name
-                            for name, id in pairs(normalized_map_name_to_id) do
-                                local name_length = #name
-                                local length_diff = name_length - input_name_length
-                                local edit_distance = CalculateStringEditDistance(input_name, gsub(name, MAP_SUFFIX_SEP, ":", 1))
-                                if length_diff > 0 then
-                                    -- name we're checking in the DB is longer than the input
-                                    edit_distance = edit_distance - length_diff -- remove penalty for insertions
-                                end
-                                if edit_distance < input_name_length then
-                                    fuzzy_matching_map_names[#fuzzy_matching_map_names + 1] = {id, edit_distance, name_length}
-                                end
-                                --]]
-                            end
+            if first_number < 0 or first_number > 100 then -- first number must be x coordinate, so range check it
+                return nil
+            end
 
-                            -- Sort by edit distance
-                            sort(fuzzy_matching_map_names,
-                                 function (a,b)
-                                     if a[2] < b[2] then
-                                         return true
-                                     elseif a[2] > b[2] then
-                                         return false
-                                     else
-                                         -- if equal edit distance, then favor the shorter one
-                                         return a[3] < b[3]
-                                     end
-                                 end
-                            )
+            local name_tokens = {}
+            for i = 1, first_number_pos - 1 do
+                name_tokens[#name_tokens + 1] = tokens[i]
+            end
+            local input_name = strlower(strjoin(" ", unpack(name_tokens)))
 
-                            -- Print the fuzzy matches
-                            for i = 1, min(#fuzzy_matching_map_names, MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW) do
-                                local id = fuzzy_matching_map_names[i][1]
-                                print(map_id_to_unique_name[id]) -- TODO: Can we offer clickables?
-                            end
-                            return nil
-                        end
-
-                        -- we have a map, x, and y
-                        local desc_tokens = {}
-                        for i = first_number_pos + 2, #tokens do
-                            desc_tokens[#desc_tokens + 1] = tokens[i]
-                        end
-                        return {uiMapID = matching_map_ids[1], position = CreateVector2D(first_number / 100, second_number / 100), desc = strconcat(unpack(desc_tokens))}
+            local matching_map_ids = {}
+            local db_probe = normalized_map_name_to_id[input_name]
+            if db_probe then
+                matching_map_ids = {db_probe}
+            else
+                -- partial matching
+                -- first try only prefixes (don't match "Greymane Manor:Ruins of Gilneas" on the input "Gilneas")
+                for db_name, db_map_id in pairs(normalized_map_name_to_id) do
+                    local db_name_sep = strfind(db_name, MAP_SUFFIX_SEP, 1, true)
+                    local prefix
+                    if db_name_sep then
+                        prefix = strsub(db_name, 1, db_name_sep - 1)
+                    else
+                        prefix = db_name
                     end
-                else
-                    -- user either provided (numerical map, x, y) or just (x, y)
-                    local third_number = tonumber(tokens[first_number_pos + 2])
-                    if third_number and third_number >= 0 and third_number <= 100 then
-                        -- user entered (numerical map, x, y)
-                        local desc_tokens = {}
-                        for i = first_number_pos + 3, #tokens do
-                            desc_tokens[#desc_tokens + 1] = tokens[i]
+
+                    if strfind(prefix, input_name, 1, true) then
+                        matching_map_ids[#matching_map_ids + 1] = db_map_id
+                    end
+                end
+                -- try suffixes too
+                if #matching_map_ids == 0 then
+                    for db_name, db_map_id in pairs(normalized_map_name_to_id) do
+                        if strfind(gsub(db_name, MAP_SUFFIX_SEP, ":", 1), input_name, 1, true) then -- front-end separators are ":"
+                            matching_map_ids[#matching_map_ids + 1] = db_map_id
                         end
-                        local desc
-                        if #desc_tokens > 0 then
-                            desc = strconcat(unpack(desc_tokens))
-                        end
-                        return {uiMapID = first_number, position = CreateVector2D(second_number / 100, third_number / 100), desc = desc}
-                    elseif first_number >= 0 and first_number <= 100 then -- first number must be x coordinate, so range check it
-                        -- user entered just (x, y)
-                        local desc_tokens = {}
-                        for i = first_number_pos + 2, #tokens do
-                            desc_tokens[#desc_tokens + 1] = tokens[i]
-                        end
-                        local desc
-                        if #desc_tokens > 0 then
-                            desc = strconcat(unpack(desc_tokens))
-                        end
-                        -- if their map is open, try pinning to map zone
-                        if WorldMapFrame:IsVisible() then
-                            return {uiMapID = WorldMapFrame:GetMapID(), position = CreateVector2D(first_number / 100, second_number / 100), desc = desc}
-                        end
-                        -- if map is closed, pin in the zone the player is currently in
-                        return {uiMapID = C_Map.GetBestMapForUnit(PLAYER), position = CreateVector2D(first_number / 100, second_number / 100), desc = desc}
                     end
                 end
             end
+
+            -- Handle bad/ambiguous map inputs
+            if #matching_map_ids > 1 then
+                if #matching_map_ids > MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW then
+                    print(#matching_map_ids .. " possible matches for zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Top results:")
+                else
+                    print(#matching_map_ids .. " possible matches for zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Did you mean:")
+                end
+
+                local matching_map_names = {}
+                for _, id in ipairs(matching_map_ids) do
+                    matching_map_names[#matching_map_names + 1] = map_id_to_unique_name[id]
+                end
+                sort(matching_map_names,
+                     function (a, b)
+                         return #a < #b
+                     end
+                )
+                for i = 1, min(MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW, #matching_map_ids) do
+                    print(matching_map_names[i]) -- TODO: can we offer clickables?
+                end
+
+                return nil
+
+            elseif #matching_map_ids == 0 then
+                -- do a fuzzy search and show the best guesses for the map
+                print("Couldn't find zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Did you mean:")
+                local fuzzy_matching_map_names = {}
+                local input_name_length = #input_name
+                for name, id in pairs(normalized_map_name_to_id) do
+                    local name_length = #name
+                    local length_diff = name_length - input_name_length
+                    local edit_distance = CalculateStringEditDistance(input_name, gsub(name, MAP_SUFFIX_SEP, ":", 1))
+                    if length_diff > 0 then
+                        edit_distance = edit_distance - length_diff -- remove penalty for insertions
+                    end
+                    if edit_distance < input_name_length then
+                        fuzzy_matching_map_names[#fuzzy_matching_map_names + 1] = {id, edit_distance, name_length}
+                    end
+                end
+
+                -- Sort by edit distance
+                sort(fuzzy_matching_map_names,
+                     function (a,b)
+                         if a[2] < b[2] then
+                             return true
+                         elseif a[2] > b[2] then
+                             return false
+                         else
+                             -- if equal edit distance, then favor the shorter one
+                             return a[3] < b[3]
+                         end
+                     end
+                )
+
+                for i = 1, min(#fuzzy_matching_map_names, MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW) do
+                    local id = fuzzy_matching_map_names[i][1]
+                    print(map_id_to_unique_name[id]) -- TODO: Can we offer clickables?
+                end
+                return nil
+            end
+
+            -- we have a map, x, and y
+            local desc_tokens = {}
+            for i = first_number_pos + 2, #tokens do
+                desc_tokens[#desc_tokens + 1] = tokens[i]
+            end
+            return {uiMapID = matching_map_ids[1], position = CreateVector2D(first_number / 100, second_number / 100), desc = strconcat(unpack(desc_tokens))}
+        else
+            -- user either provided (numerical map, x, y) or just (x, y)
+            local third_number = tonumber(tokens[first_number_pos + 2])
+            if third_number and third_number >= 0 and third_number <= 100 then
+                -- user entered (numerical map, x, y)
+                local desc_tokens = {}
+                for i = first_number_pos + 3, #tokens do
+                    desc_tokens[#desc_tokens + 1] = tokens[i]
+                end
+                local desc
+                if #desc_tokens > 0 then
+                    desc = strconcat(unpack(desc_tokens))
+                end
+                return {uiMapID = first_number, position = CreateVector2D(second_number / 100, third_number / 100), desc = desc}
+            elseif first_number >= 0 and first_number <= 100 then -- first number must be x coordinate, so range check it
+                -- user entered just (x, y)
+                local desc_tokens = {}
+                for i = first_number_pos + 2, #tokens do
+                    desc_tokens[#desc_tokens + 1] = tokens[i]
+                end
+                local desc
+                if #desc_tokens > 0 then
+                    desc = strconcat(unpack(desc_tokens))
+                end
+                -- if their map is open, pin to the zone they're open to
+                if WorldMapFrame:IsVisible() then
+                    return {uiMapID = WorldMapFrame:GetMapID(), position = CreateVector2D(first_number / 100, second_number / 100), desc = desc}
+                end
+                -- if map is closed, pin in the zone the player is currently in
+                return {uiMapID = C_Map.GetBestMapForUnit(PLAYER), position = CreateVector2D(first_number / 100, second_number / 100), desc = desc}
+            end
         end
     end
-    return nil
 end
 
 --Begin Hooks
@@ -899,11 +821,13 @@ do
     end
 end
 
+-- !!! TODO: Handle clicks to hyperlinks! Needs to set current_map correctly. Hyperlinks can go to pinpin-only maps!
+-- TODO: Add sounds for pin placement (doesn't need pin removal - clicking a hyperlink opens you up to the map with the pin on it anyway)
 -- For clicks to chat waypoint links, use adjacent text for the waypoint desc (looks for text to the right of the link first)
 hooksecurefunc("ChatFrame_OnHyperlinkShow", function (self, link, text)
     if strsub(link, 1, 8) == "worldmap" then
         local map_point = C_Map.GetUserWaypointFromHyperlink(link)
-        if map_point and C_Map.CanSetUserWaypointOnMap(map_point.uiMapID) then
+        if map_point and C_Map.CanSetUserWaypointOnMap(map_point.uiMapID) then -- TODO: is it even possible to generate map hyperlinks to maps we can't place pins on? If it is, we should handle those better anyway
             -- Blizzard didn't bother to add sounds for this if the map is open, so let's add them
             if is_pin_visible_on_open_map() then
                 PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CLICK_TO_PLACE, nil, SOUNDKIT_ALLOW_DUPLICATES)
@@ -988,7 +912,6 @@ do
 end
 
 -- Custom min and max viewable distance for pins
--- GetTargetAlphaBaseValue only ends up setting widget alpha, so taint should not propagate
 do
     local old_GetTargetAlphaBaseValue = SuperTrackedFrame.GetTargetAlphaBaseValue
     function SuperTrackedFrame:GetTargetAlphaBaseValue()
@@ -1016,7 +939,7 @@ do
     end
 end
 
--- Hooks for data providers and overlays for requires_pinpin pins and pins placed via map clicks
+-- Hooks for Blizzard data providers and overlays
 do
     -- Data providers are unlabeled, so we have to find it
     local waypoint_location_data_provider
@@ -1053,14 +976,14 @@ do
         -- No point supertracking pins that require PinPin, and we can't share them normally
         if current_waypoint.requires_pinpin then
             if IsModifiedClick("CHATLINK") then
-                -- !!! should offer a way to transmit this to other PinPin users and/or just print the coords for anyone else
+                -- TODO: Generate the link, but warn them that non-pinpin users can't use it
             elseif mouse_button == "LeftButton" then
                 print("This map pin is PinPin-only, and can't be supertracked.")
             end
         end
     end)
 
-    -- Hook the add/remove click handler so we can deal with PinPin-only pins
+    -- Hook the add/remove waypoint click handler so we can add/remove PinPin-only pins with it too
     hooksecurefunc(waypoint_location_data_provider, "HandleClick", function (self)
         local map = self:GetMap()
         local map_id = map:GetMapID()
@@ -1082,11 +1005,11 @@ do
                 -- we're removing a pin
                 clear_waypoint()
             elseif current_waypoint and current_waypoint.proxy_for and not C_Map.GetUserWaypoint() then
-                -- we're deleting a proxy waypoint
+                -- we're deleting a pin that used a proxy
                 current_waypoint = nil
                 return
             else
-                -- we're adding a proxy or requires_pinpin pin
+                -- we're adding a proxied pin or requires_pinpin pin
                 UIErrorsFrame:Clear()
                 UIErrorsFrame:Show()
                 local scroll_container = map.ScrollContainer
@@ -1109,7 +1032,6 @@ do
         local current_waypoint_pos = current_waypoint.position
         local x, y
         if current_waypoint_map == open_map then
-            -- the pin is on the map that's open
             pin_pos = current_waypoint_pos
             x, y = pin_pos.x, pin_pos.y
         else
@@ -1122,7 +1044,6 @@ do
             local _, pin_pos = C_Map.GetMapPosFromWorldPos(current_waypoint_instance, world_pos, open_map)
             x, y = pin_pos.x, pin_pos.y
             if x < 0 or x > 1 or y < 0 or y > 1 then
-                -- waypoint is out of visible map bounds
                 return
             end
         end
@@ -1131,17 +1052,18 @@ do
         self.pin:SetPosition(pin_pos.x, pin_pos.y)
     end)
 
+    -- Must be called after removing a map pin to get it to actually hide
     refresh_waypoint_location_data_provider = function ()
         waypoint_location_data_provider:RefreshAllData()
     end
 
-    -- Display the button so we can place PinPin-only pins with it too
+    -- Keep the pin-placement button on the map UI enabled for all maps so we can place PinPin-only pins with it too
     hooksecurefunc(waypoint_button_frame, "Refresh", function (self)
         self:Enable()
         self:DesaturateHierarchy(0)
     end)
 
-    -- Display a more appropriate tooltip for PinPin-only maps
+    -- Display a more appropriate tooltip for the pin-placement button for PinPin-only maps
     waypoint_button_frame:HookScript("OnEnter", function (self)
         GameTooltip:ClearLines()
         GameTooltip_AddNormalLine(GameTooltip, MAP_PIN_TOOLTIP)
@@ -1174,6 +1096,7 @@ local function wayb()
     set_waypoint(map, C_Map.GetPlayerMapPosition(map, PLAYER), "Wayback")
 end
 
+-- TODO: Allow /waym [map name] or /waym [map number] to just open the map to a specific map
 -- open map to current waypoint
 local function waym()
     if current_waypoint then
