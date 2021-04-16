@@ -1,10 +1,4 @@
--- !!! add commands for getting waypoint history
--- !!!    add a clickable pin for each one if possible
--- !!!        can printed pins (that aren't sent over a channel) have custom text?
--- !!! show coords in map (and on minimap?)
--- !!! make sure all the commands that don't work in instances give error messages
--- !!! when we clear waypoints without setting a new waypoint, we need to set current_waypoint = nil manually, to handle requires_pinpin waypoints
--- !!! WorldQuestList needs an exception because it tries to overwrite /way # # unless TomTom is installed
+-- TODO: put in an issue for WorldQuestList because it tries to overwrite /way # # unless TomTom is installed
 
 local PLAYER = "player"
 
@@ -14,6 +8,13 @@ pinpin_frame.name = "PinPin"
 local saved_variables = {}
 local saved_variables_per_character = {}
 
+-- current_waypoint, nil if no waypoint, otherwise
+--     uiMapID
+--     position (Vector2D)
+--     desc (custom description that appears in tooltips and shares)
+--     string (a user-readable string with map name and coords)
+--     proxy_for (this waypoint isn't actually pinned to the map it appears to be, but rather a parent map, which is stored as proxy_for)
+--     requires_pinpin (for pins to maps that don't allow them and can't be proxied - can't be supertracked or shared with non-PinPin users)
 local current_waypoint -- Stores the UiMapPoint of the current waypoint (plus a printable string and a custom desc) or nil if no waypoint
 
 -- Map Names
@@ -37,7 +38,6 @@ local MAP_SUFFIX_SEP = string.char(3) -- this should be a safe value that is nev
 
 -- Begin Process Maps for Name and Data
 -- We're going to do this every reload, and it involves most of the heavy lifting, so it is substantially inlined (benchmark: ~30ms)
-start = debugprofilestop()
 do
     -- Get the root map by finding the furthest ancestor of the fallback world map
     local root_map_id = C_Map.GetFallbackWorldMapID()
@@ -477,32 +477,6 @@ do
     end
 end
 -- End Process Maps for Name and Data
-print(debugprofilestop() - start)
-
--- paste_in_chat(text)
--- Hook OnEnterPressed then paste into chat (for commands that fill text into edit box, letting the user edit and send with Enter normally)
-local paste_in_chat
-do
-    local keeping_focus = false
-    local paste
-
-    hooksecurefunc("ChatEdit_OnEnterPressed", function ()
-        if keeping_focus then
-            local edit_box = LAST_ACTIVE_CHAT_EDIT_BOX
-            if C_CVar.GetCVar("chatStyle") == "classic" then
-                edit_box:Show()
-            end
-            edit_box:SetFocus()
-            edit_box:SetText(paste)
-            keeping_focus = false
-        end
-    end)
-
-    function paste_in_chat(text)
-        paste = text
-        keeping_focus = true
-    end
-end
 
 -- do_after_combat(function, args...) to call protected functions once combat ends
 local do_after_combat, on_player_regen_enabled
@@ -530,15 +504,15 @@ local function unrotate_minimap_coords(rotated_x, rotated_y)
     return unrotated_x, unrotated_y
 end
 
--- Used to play pin sounds if the player can see the pin on their map
+-- Used, e.g., to play pin sounds if the player can see the pin on their map
 local function is_pin_visible_on_open_map()
-    if not WorldMapFrame:IsVisible() then
+    if not WorldMapFrame:IsVisible() or not current_waypoint then
         return false
     end
 
-    local x, y
     local open_map = WorldMapFrame:GetMapID()
     local position_in_open_map = C_Map.GetUserWaypointPositionForMap(open_map)
+    local x, y
     if position_in_open_map then
         x, y = position_in_open_map:GetXY()
     else
@@ -549,51 +523,14 @@ local function is_pin_visible_on_open_map()
         if open_map_instance ~= current_waypoint_instance then
             return false
         end
-        x, y = current_waypoint.position:GetXY()
+        x, y = current_waypoint.position.x, current_waypoint.position.y
     end
     return x >= 0 and x <= 1 and y >= 0 and y <=1
 end
 
--- For clicks to chat waypoint links, use adjacent text for the waypoint desc (looks for text to the right of the link first)
-hooksecurefunc("ChatFrame_OnHyperlinkShow", function (self, link, text)
-    if strsub(link, 1, 8) == "worldmap" then
-        local map_point = C_Map.GetUserWaypointFromHyperlink(link)
-        if map_point and C_Map.CanSetUserWaypointOnMap(map_point.uiMapID) then
-            -- Blizzard didn't bother to add sounds for this if the map is open, so let's add them
-            if is_pin_visible_on_open_map() then
-                PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CLICK_TO_PLACE, nil, SOUNDKIT_ALLOW_DUPLICATES)
-            end
-            -- Search through the chat frame for the message
-            for i = self:GetNumMessages(), 1, -1 do
-                local chat_text = self:GetMessageInfo(i)
-                local start_pos, end_pos = strfind(chat_text, text, 1, true)
-                if end_pos then
-                    -- First see if there's any text we can use to the right of the hyperlink
-                    local right = strtrim(strsub(chat_text, end_pos + 1))
-                    if right == "" then
-                        -- No text to the right, so check for text to the left
-                        local left = strtrim(strsub(chat_text, 1, start_pos - 1))
-                        local left_strip_hyperlinks = select(4, ExtractHyperlinkString(left))
-                        if left_strip_hyperlinks then
-                            local colon_pos = strfind(left_strip_hyperlinks, ":", 1, true)
-                            if colon_pos then
-                                left = strtrim(strsub(left_strip_hyperlinks, colon_pos + 1))
-                            end
-                        end
-                        if left ~= "" then
-                            current_waypoint.desc = left
-                        end
-                    else
-                        current_waypoint.desc = right
-                    end
-                    break
-                end
-            end
-        end
-    end
-end)
-
 -- Track the last 100 waypoints we've set
+-- TODO: Add commands for accessing history
+-- TODO: Can history display provide clickable pins?
 local waypoint_history_add, waypoint_history_last, waypoint_history_save, waypoint_history_restore
 do
     -- implemented as an array with a wrap-around index
@@ -638,178 +575,13 @@ do
     end
 end
 
-local function clear_waypoint()
-    if current_waypoint then
-        if is_pin_visible_on_open_map() then
-            C_Map.ClearUserWaypoint()
-            PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_REMOVE, nil, SOUNDKIT_ALLOW_DUPLICATES)
-        else
-            C_Map.ClearUserWaypoint()
-        end
-        current_waypoint = nil
-    end
-end
-
-local set_waypoint
-
--- Hooks for waypoint data provider to deal with PinPin-only pins and supertracking
-local refresh_waypoint_location_data_provider
-do
-    -- Data providers are unlabeled, so we have to find it
-    local waypoint_location_data_provider
-    for data_provider in pairs(WorldMapFrame.dataProviders) do
-        if data_provider.CanPlacePin then -- CanPlacePin is our shibboleth for this particular data provider
-            waypoint_location_data_provider = data_provider
-            break
-        end
-    end
-    if not waypoint_location_data_provider then
-        error("Couldn't find the map pin data provider.")
-    end
-
-    -- Overlay frames are unlabeled, so we have to find it
-    local waypoint_button_frame
-    local world_map_frame_children = {WorldMapFrame:GetChildren()}
-    for i = 1, #world_map_frame_children do
-        local child = world_map_frame_children[i]
-        if child.SetActive then
-            waypoint_button_frame = child
-            break
-        end
-    end
-    if not waypoint_button_frame then
-        error("Couldn't find the map overlay with the map pin button.")
-    end
-
-    -- Override waypoint map click handler, so it can't automatially un-supertrack added pin
-    hooksecurefunc(waypoint_location_data_provider, "HandleClick", function ()
-        if current_waypoint and saved_variables.semi_automatic_supertrack_pins and (saved_variables.automatic_supertrack_pins or not C_SuperTrack.IsSuperTrackingAnything()) then
-            C_SuperTrack.SetSuperTrackedUserWaypoint(true)
-        end
-    end)
-
-    -- CLICK HANDLERS
-    -- Blizzard uses two separate click handlers: one on the pin itself, and one on the data provider that checks if the cursor is in the pin
-    --     the pin click handler deals with creating chat hyperlinks and toggling supertracking
-    --     the data provider click handler deals with adding and removing pins
-
-    local hooked_pin = false
-    local function hook_pin(pin)
-        if hooked_pin then -- we only need to do this once
-            return
-        end
-        hooked_pin = true
-
-        -- No point supertracking pins that require PinPin, and we can't share them normally
-        hooksecurefunc(pin, "OnMouseClickAction", function (self, mouse_button)
-            if current_waypoint.requires_pinpin then
-                if IsModifiedClick("CHATLINK") then
-                    -- !!! should offer a way to transmit this to other PinPin users and/or just print the coords for anyone else
-                elseif mouse_button == "LeftButton" then
-                    print("Can't supertrack instance pins.") -- !!! print this better
-                end
-            end
-        end)
-    end
-
-    -- Hook the add/remove click handler so we can deal with PinPin-only pins
-    hooksecurefunc(waypoint_location_data_provider, "HandleClick", function (self)
-        local map = self:GetMap()
-        local map_id = map:GetMapID()
-        if not C_Map.CanSetUserWaypointOnMap(map_id) then
-            if self.pin and self.pin:IsMouseOver() then
-                -- we're removing a pin
-                clear_waypoint()
-                self:RefreshAllData()
-            elseif not current_waypoint and waypoint_history_last() and waypoint_history_last().proxy_for then
-                --!!! this seems like it should work, but it doesn't! Is something wrong with the history? Is current_waypoint not necessarily cleared?
-                --!!! current_waypoint isn't cleared, since the HandleClick doesn't know about current_waypoint and the on-waypoint-update event doesn't clear it anymore - maybe it does need to clear it?
-                --    !!! if it does clear it, then I need to do something differently when I set requires_pinpin waypoints
-                --    !!! should take a look at history too and make sure it's not getting weird or extra entries - I think it might be
-                -- we must have just deleted a proxy - we don't need to do anything
-                return
-            else
-                -- we're adding a pin
-                UIErrorsFrame:Clear()
-                UIErrorsFrame:Show()
-                local scroll_container = map.ScrollContainer
-                local cursor_x, cursor_y = scroll_container:NormalizeUIPosition(scroll_container:GetCursorPosition())
-                set_waypoint(map_id, CreateVector2D(cursor_x, cursor_y))
-                C_SuperTrack.SetSuperTrackedUserWaypoint(false)
-            end
-        end
-        waypoint_button_frame:SetActive(false)
-    end)
-
-    -- Display pins on instance maps
-    hooksecurefunc(waypoint_location_data_provider, "RefreshAllData", function (self)
-        if not current_waypoint or not current_waypoint.requires_pinpin then
-            return
-        end
-
-        local pin_pos
-        local open_map = WorldMapFrame:GetMapID()
-        local current_waypoint_map = current_waypoint.uiMapID
-        local current_waypoint_pos = current_waypoint.position
-        if current_waypoint_map == open_map then
-            -- the pin is on the map that's open
-            pin_pos = current_waypoint_pos
-        else
-            -- see if the pin should show up on this map too
-            local current_waypoint_instance, world_pos = C_Map.GetWorldPosFromMapPos(current_waypoint_map, current_waypoint_pos)
-            local open_map_instance = C_Map.GetWorldPosFromMapPos(open_map, current_waypoint_pos) -- just reuse position (we only care about getting instance ID anyway)
-            if current_waypoint_instance ~= open_map_instance then
-                return
-            end
-            local _, pin_pos = C_Map.GetMapPosFromWorldPos(current_waypoint_instance, world_pos, open_map)
-            local x, y = pin_pos:GetXY()
-            if x < 0 or x > 1 or y < 0 or y > 1 then
-                -- waypoint is out of map bounds
-                return
-            end
-        end
-
-        self.pin = self:GetMap():AcquirePin("WaypointLocationPinTemplate");
-
-        -- Hook the pin's click handler so we can deal with clicks to PinPin-only pins
-        hook_pin(self.pin)
-
-        self.pin:SetPosition(pin_pos:GetXY())
-    end)
-
-    refresh_waypoint_location_data_provider = function ()
-        waypoint_location_data_provider:RefreshAllData()
-    end
-
-    -- Display the button so we can play PinPin-only pins with it too
-    hooksecurefunc(waypoint_button_frame, "Refresh", function (self)
-        self:Enable()
-        self:DesaturateHierarchy(0)
-    end)
-
-    -- Display a more appropriate tooltip for PinPin-only maps
-    waypoint_button_frame:HookScript("OnEnter", function (self)
-        GameTooltip:ClearLines()
-        GameTooltip_AddNormalLine(GameTooltip, MAP_PIN_TOOLTIP)
-        GameTooltip_AddBlankLineToTooltip(GameTooltip)
-        GameTooltip_AddInstructionLine(GameTooltip, MAP_PIN_TOOLTIP_INSTRUCTIONS)
-        GameTooltip:Show()
-    end)
-end
-
--- Round number to specified decimal places
-local function round_number(number, places)
-    local mult = 10 ^ places
-    return floor(number * mult + 0.5) / mult
-end
-
 -- e.g., given 1.31, 1.2, returns 2 because .31 goes to 2 decimal places (and that's more places than .2)
 -- so we can, e.g., print "1.31, 1.20" rather than "1.31, 1.2"
-local function longest_fractional_length(...)
+local function longest_fractional_part(...)
     local nums = {...}
     local places = 0
     for _, num in ipairs(nums) do
-        test_places = #tostring(num % 1) - 2
+        local test_places = #tostring(num % 1) - 2 -- the -2 is for the "0."
         if test_places > places then
             places = test_places
         end
@@ -818,58 +590,50 @@ local function longest_fractional_length(...)
 end
 
 local function get_waypoint_display_strings(waypoint)
-    local DECIMAL_PLACES = 2
-    -- x and y to 2 decimal places, or fewer when least significant digit is 0
-    local x = round_number(waypoint.position.x * 100, DECIMAL_PLACES)
-    local y = round_number(waypoint.position.y * 100, DECIMAL_PLACES)
-    local places = longest_fractional_length(x, y)
-    if places > DECIMAL_PLACES then -- in case of floating precision problems
-        places = DECIMAL_PLACES
+    local MAX_DECIMAL_PLACES = 2
+
+    local x = waypoint.position.x * 100
+    local y = waypoint.position.y * 100
+    local places = longest_fractional_part(x, y)
+    if places > MAX_DECIMAL_PLACES then
+        places = MAX_DECIMAL_PLACES
     end
     local format_string = strconcat("%.", places, "f")
     return map_id_to_unique_name[waypoint.uiMapID], format(format_string, x), format(format_string, y)
 end
 
-local function on_user_waypoint_updated()
-    local waypoint = C_Map.GetUserWaypoint() or current_waypoint
-    if waypoint then
-        current_waypoint = waypoint
-        local display_name, display_x, display_y = get_waypoint_display_strings(current_waypoint)
-        current_waypoint.string = strconcat(display_name, " (", display_x, ", ", display_y, ")")
-        waypoint_history_add(waypoint)
-        if not current_waypoint.requires_pinpin and saved_variables.semi_automatic_supertrack_pins and (saved_variables.automatic_supertrack_pins or not C_SuperTrack.IsSuperTrackingAnything()) then
-            C_SuperTrack.SetSuperTrackedUserWaypoint(true)
+local function set_current_waypoint_string()
+    local display_name, display_x, display_y = get_waypoint_display_strings(current_waypoint)
+    current_waypoint.string = strconcat(display_name, " (", display_x, ", ", display_y, ")")
+end
+
+local refresh_waypoint_location_data_provider -- implemented in hooks
+
+local function clear_waypoint()
+    if current_waypoint then
+        if is_pin_visible_on_open_map() then
+            PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_REMOVE, nil, SOUNDKIT_ALLOW_DUPLICATES)
         end
+        C_Map.ClearUserWaypoint()
+        current_waypoint = nil
+        refresh_waypoint_location_data_provider()
     end
 end
 
-local function can_set_waypoint(map)
-    -- !!! is this necessary anywhere anymore?
-    local can_set_waypoint = map_id_to_data[map] or C_Map.CanSetUserWaypointOnMap(map)
-    if not can_set_waypoint then
-        -- !!! send the player an error message
-        print("Error! Can't set a waypoint on that map!")
-    end
-    return can_set_waypoint
-end
-
-set_waypoint = function(map, position, desc)
+local function set_waypoint(map, position, desc)
     local map_data = map_id_to_data(map)
-    if not map_data then
-        -- the map must not exist, map_id_to_data() already sent an error
-        return
-    end
 
-    current_waypoint = nil
-    C_Map.ClearUserWaypoint() -- waypoint change event doesn't fire if setting same waypoint, but we need that to fire to update supertracking if auto-supertracking is on, so clear it first
+    local old_pin_visible = is_pin_visible_on_open_map() -- there was a pre-existing pin that we're replacing
+
     if map_data.requires_pinpin then
+        C_Map.ClearUserWaypoint()
         current_waypoint = {
             uiMapID = map,
             position = position,
             requires_pinpin = true
         }
-        on_user_waypoint_updated() -- trigger this event's handler manually, since we're not setting a native pin
         refresh_waypoint_location_data_provider()
+        C_SuperTrack.SetSuperTrackedUserWaypoint(false) -- no point supertracking requires_pinpin pins
     else
         local proxy = map_data.proxy
         local proxy_for
@@ -881,14 +645,26 @@ set_waypoint = function(map, position, desc)
         end
         local map_point = UiMapPoint.CreateFromVector2D(map, position)
         C_Map.SetUserWaypoint(map_point)
+        current_waypoint = C_Map.GetUserWaypoint()
         current_waypoint.proxy_for = proxy_for
+
+        if saved_variables.semi_automatic_supertrack_pins and (saved_variables.automatic_supertrack_pins or not C_SuperTrack.IsSuperTrackingAnything()) then
+            C_SuperTrack.SetSuperTrackedUserWaypoint(true)
+        end
     end
+
+    set_current_waypoint_string()
+
     if desc then
         current_waypoint.desc = strtrim(desc)
     end
 
+    waypoint_history_add(current_waypoint)
+
     if is_pin_visible_on_open_map() then
         PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CLICK_TO_PLACE, nil, SOUNDKIT_ALLOW_DUPLICATES)
+    elseif old_pin_visible then
+        PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_REMOVE, nil, SOUNDKIT_ALLOW_DUPLICATES)
     end
 end
 
@@ -981,7 +757,6 @@ local function parse_waypoint_command(msg)
                         local matching_map_ids_count = #matching_map_ids
                         if matching_map_ids_count > MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW then
                             -- Too many matches
-                            -- !!! print this better
                             print(matching_map_ids_count .. " possible matches for zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Top results:")
                             local matching_map_names = {}
                             for _, id in ipairs(matching_map_ids) do
@@ -993,12 +768,11 @@ local function parse_waypoint_command(msg)
                                  end
                             )
                             for i = 1, MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW do
-                                print(matching_map_names[i]) -- !!! do better than print (can we offer clickables?)
+                                print(matching_map_names[i]) -- TODO: can we offer clickables?
                             end
                             return nil
                         elseif matching_map_ids_count > 1 then
                             -- Multiple matches
-                            -- !!!print this better
                             print(matching_map_ids_count .. " possible matches for zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Did you mean:")
                             local matching_map_names = {}
                             for _, id in ipairs(matching_map_ids) do
@@ -1010,12 +784,11 @@ local function parse_waypoint_command(msg)
                                  end
                             )
                             for _, name in ipairs(matching_map_names) do
-                                print(name) -- !!! do better than print (can we offer clickables?)
+                                print(name) -- TODO: can we offer clickables?
                             end
                             return nil
                         elseif matching_map_ids_count == 0 then
                             -- do a fuzzy search and show the best guesses for the map
-                            -- !!!print this better
                             print("Couldn't find zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Did you mean:")
                             local fuzzy_matching_map_names = {}
                             local input_name_length = #input_name
@@ -1050,7 +823,7 @@ local function parse_waypoint_command(msg)
                             -- Print the fuzzy matches
                             for i = 1, min(#fuzzy_matching_map_names, MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW) do
                                 local id = fuzzy_matching_map_names[i][1]
-                                print(map_id_to_unique_name[id]) -- !!! do better than print
+                                print(map_id_to_unique_name[id]) -- TODO: Can we offer clickables?
                             end
                             return nil
                         end
@@ -1100,15 +873,296 @@ local function parse_waypoint_command(msg)
     return nil
 end
 
+--Begin Hooks
+-- paste_in_chat(text)
+-- Hook OnEnterPressed then paste into chat (for commands that fill text into edit box, letting the user edit and send with Enter normally)
+local paste_in_chat
+do
+    local keeping_focus = false
+    local paste
+
+    hooksecurefunc("ChatEdit_OnEnterPressed", function ()
+        if keeping_focus then
+            local edit_box = LAST_ACTIVE_CHAT_EDIT_BOX
+            if C_CVar.GetCVar("chatStyle") == "classic" then
+                edit_box:Show()
+            end
+            edit_box:SetFocus()
+            edit_box:SetText(paste)
+            keeping_focus = false
+        end
+    end)
+
+    function paste_in_chat(text)
+        paste = text
+        keeping_focus = true
+    end
+end
+
+-- For clicks to chat waypoint links, use adjacent text for the waypoint desc (looks for text to the right of the link first)
+hooksecurefunc("ChatFrame_OnHyperlinkShow", function (self, link, text)
+    if strsub(link, 1, 8) == "worldmap" then
+        local map_point = C_Map.GetUserWaypointFromHyperlink(link)
+        if map_point and C_Map.CanSetUserWaypointOnMap(map_point.uiMapID) then
+            -- Blizzard didn't bother to add sounds for this if the map is open, so let's add them
+            if is_pin_visible_on_open_map() then
+                PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CLICK_TO_PLACE, nil, SOUNDKIT_ALLOW_DUPLICATES)
+            end
+            -- Search through the chat frame for the message
+            for i = self:GetNumMessages(), 1, -1 do
+                local chat_text = self:GetMessageInfo(i)
+                local start_pos, end_pos = strfind(chat_text, text, 1, true)
+                if end_pos then
+                    -- First see if there's any text we can use to the right of the hyperlink
+                    local right = strtrim(strsub(chat_text, end_pos + 1))
+                    if right == "" then
+                        -- No text to the right, so check for text to the left
+                        local left = strtrim(strsub(chat_text, 1, start_pos - 1))
+                        local left_strip_hyperlinks = select(4, ExtractHyperlinkString(left))
+                        if left_strip_hyperlinks then
+                            local colon_pos = strfind(left_strip_hyperlinks, ":", 1, true)
+                            if colon_pos then
+                                left = strtrim(strsub(left_strip_hyperlinks, colon_pos + 1))
+                            end
+                        end
+                        if left ~= "" then
+                            current_waypoint.desc = left
+                        end
+                    else
+                        current_waypoint.desc = right
+                    end
+                    break
+                end
+            end
+        end
+    end
+end)
+
+-- Clear active pin when user comes within user-defined distance
+hooksecurefunc(SuperTrackedFrame, "UpdateDistanceText", function ()
+    if saved_variables.automatic_clear then
+        local distance = C_Navigation.GetDistance()
+        if distance > 0 and distance <= saved_variables.clear_distance then
+            clear_waypoint()
+        end
+    end
+end)
+
+-- More useful Map Pin tooltips
+do
+    local function update_waypoint_tooltip()
+        GameTooltip_SetTitle(GameTooltip, current_waypoint.desc or "Map Pin", NORMAL_FONT_COLOR)
+        local distance = C_Navigation.GetDistance()
+        if distance > 0 then
+            GameTooltip_AddColoredLine(GameTooltip, format("%d |4yard:yards away", floor(C_Navigation.GetDistance())), WHITE_FONT_COLOR)
+        end
+        GameTooltip_AddColoredLine(GameTooltip, current_waypoint.string, LIGHTGRAY_FONT_COLOR)
+        GameTooltip_AddInstructionLine(GameTooltip, "<Shift-Click to share pin in chat>")
+        GameTooltip_AddInstructionLine(GameTooltip, MAP_PIN_REMOVE)
+        GameTooltip:Show()
+    end
+
+    local in_waypoint_tooltip = false
+
+    hooksecurefunc(WaypointLocationPinMixin, "OnMouseEnter", function ()
+        in_waypoint_tooltip = true
+        if saved_variables.better_tooltips then
+            update_waypoint_tooltip()
+        end
+    end)
+
+    hooksecurefunc(WaypointLocationPinMixin, "OnMouseLeave", function ()
+        in_waypoint_tooltip = false
+    end)
+
+    GameTooltip:HookScript("OnUpdate", function ()
+        if in_waypoint_tooltip and saved_variables.better_tooltips then
+            if current_waypoint then
+                update_waypoint_tooltip()
+            else
+                -- Waypoint was cleared while the cursor was inside it
+                in_waypoint_tooltip = false
+            end
+        end
+    end)
+end
+
+-- Custom min and max viewable distance for pins
+-- GetTargetAlphaBaseValue only ends up setting widget alpha, so taint should not propagate
+do
+    local old_GetTargetAlphaBaseValue = SuperTrackedFrame.GetTargetAlphaBaseValue
+    function SuperTrackedFrame:GetTargetAlphaBaseValue()
+        local alpha = old_GetTargetAlphaBaseValue(self)
+        local distance = C_Navigation.GetDistance()
+        local unlimited = saved_variables.unlimited_pin_distance
+        local min_distance = saved_variables.min_pin_distance
+        local max_distance = saved_variables.max_pin_distance
+        if not unlimited and distance > max_distance then
+            alpha = 0
+        elseif distance < min_distance then
+            alpha = 0
+        elseif alpha == 0 then
+            if distance > 500 then
+                if unlimited or distance <= max_distance then
+                    alpha = 0.6
+                end
+            else
+                if distance >= min_distance then
+                    alpha = 1
+                end
+            end
+        end
+        return alpha
+    end
+end
+
+-- Hooks for data providers and overlays for requires_pinpin pins and pins placed via map clicks
+do
+    -- Data providers are unlabeled, so we have to find it
+    local waypoint_location_data_provider
+    for data_provider in pairs(WorldMapFrame.dataProviders) do
+        if data_provider.CanPlacePin then -- CanPlacePin is our shibboleth for this particular data provider
+            waypoint_location_data_provider = data_provider
+            break
+        end
+    end
+    if not waypoint_location_data_provider then
+        error("Couldn't find the map pin data provider.")
+    end
+
+    -- Overlay frames are unlabeled, so we have to find it
+    local waypoint_button_frame
+    local world_map_frame_children = {WorldMapFrame:GetChildren()}
+    for i = 1, #world_map_frame_children do
+        local child = world_map_frame_children[i]
+        if child.SetActive then
+            waypoint_button_frame = child
+            break
+        end
+    end
+    if not waypoint_button_frame then
+        error("Couldn't find the map overlay with the map pin button.")
+    end
+
+    -- CLICK HANDLERS
+    -- Blizzard uses two separate click handlers: one on the pin itself, and one on the data provider that checks if the cursor is in the pin
+    --     the pin click handler deals with creating chat hyperlinks and toggling supertracking
+    --     the data provider click handler deals with adding and removing pins
+
+    hooksecurefunc(WaypointLocationPinMixin, "OnMouseClickAction", function ()
+        -- No point supertracking pins that require PinPin, and we can't share them normally
+        if current_waypoint.requires_pinpin then
+            if IsModifiedClick("CHATLINK") then
+                -- !!! should offer a way to transmit this to other PinPin users and/or just print the coords for anyone else
+            elseif mouse_button == "LeftButton" then
+                print("This map pin is PinPin-only, and can't be supertracked.")
+            end
+        end
+    end)
+
+    -- Hook the add/remove click handler so we can deal with PinPin-only pins
+    hooksecurefunc(waypoint_location_data_provider, "HandleClick", function (self)
+        local map = self:GetMap()
+        local map_id = map:GetMapID()
+        if C_Map.CanSetUserWaypointOnMap(map_id) then
+            -- we're dealing with native pins
+            if C_Map.GetUserWaypoint() then
+                current_waypoint = C_Map.GetUserWaypoint()
+                set_current_waypoint_string()
+
+                if saved_variables.semi_automatic_supertrack_pins and (saved_variables.automatic_supertrack_pins or not C_SuperTrack.IsSuperTrackingAnything()) then
+                    C_SuperTrack.SetSuperTrackedUserWaypoint(true)
+                end
+            else
+                current_waypoint = nil
+            end
+        else
+            -- we're dealing with a map that requires a proxy or requires_pinpin
+            if self.pin and self.pin:IsMouseOver() then
+                -- we're removing a pin
+                clear_waypoint()
+            elseif current_waypoint and current_waypoint.proxy_for and not C_Map.GetUserWaypoint() then
+                -- we're deleting a proxy waypoint
+                current_waypoint = nil
+                return
+            else
+                -- we're adding a proxy or requires_pinpin pin
+                UIErrorsFrame:Clear()
+                UIErrorsFrame:Show()
+                local scroll_container = map.ScrollContainer
+                local cursor_x, cursor_y = scroll_container:NormalizeUIPosition(scroll_container:GetCursorPosition())
+                set_waypoint(map_id, CreateVector2D(cursor_x, cursor_y))
+            end
+        end
+        waypoint_button_frame:SetActive(false)
+    end)
+
+    -- Display requires_pinpin pins on instance maps
+    hooksecurefunc(waypoint_location_data_provider, "RefreshAllData", function (self)
+        if not current_waypoint or not current_waypoint.requires_pinpin then
+            return
+        end
+
+        local pin_pos
+        local open_map = WorldMapFrame:GetMapID()
+        local current_waypoint_map = current_waypoint.uiMapID
+        local current_waypoint_pos = current_waypoint.position
+        local x, y
+        if current_waypoint_map == open_map then
+            -- the pin is on the map that's open
+            pin_pos = current_waypoint_pos
+            x, y = pin_pos.x, pin_pos.y
+        else
+            -- see if the pin should show up on this map too
+            local current_waypoint_instance, world_pos = C_Map.GetWorldPosFromMapPos(current_waypoint_map, current_waypoint_pos)
+            local open_map_instance = C_Map.GetWorldPosFromMapPos(open_map, current_waypoint_pos) -- just reuse position (we only care about getting instance ID anyway)
+            if current_waypoint_instance ~= open_map_instance then
+                return
+            end
+            local _, pin_pos = C_Map.GetMapPosFromWorldPos(current_waypoint_instance, world_pos, open_map)
+            x, y = pin_pos.x, pin_pos.y
+            if x < 0 or x > 1 or y < 0 or y > 1 then
+                -- waypoint is out of visible map bounds
+                return
+            end
+        end
+
+        self.pin = self:GetMap():AcquirePin("WaypointLocationPinTemplate");
+        self.pin:SetPosition(pin_pos.x, pin_pos.y)
+    end)
+
+    refresh_waypoint_location_data_provider = function ()
+        waypoint_location_data_provider:RefreshAllData()
+    end
+
+    -- Display the button so we can place PinPin-only pins with it too
+    hooksecurefunc(waypoint_button_frame, "Refresh", function (self)
+        self:Enable()
+        self:DesaturateHierarchy(0)
+    end)
+
+    -- Display a more appropriate tooltip for PinPin-only maps
+    waypoint_button_frame:HookScript("OnEnter", function (self)
+        GameTooltip:ClearLines()
+        GameTooltip_AddNormalLine(GameTooltip, MAP_PIN_TOOLTIP)
+        GameTooltip_AddBlankLineToTooltip(GameTooltip)
+        GameTooltip_AddInstructionLine(GameTooltip, MAP_PIN_TOOLTIP_INSTRUCTIONS)
+        GameTooltip:Show()
+    end)
+end
+-- End Hooks
+
+-- Begin Commands
 -- Set a user-specified waypoint, /way [map name|map number] x y [description]
 local function way(msg)
     local waypoint = parse_waypoint_command(msg)
     if waypoint then
         set_waypoint(waypoint.uiMapID, waypoint.position, waypoint.desc)
     else
-        print("Some syntax")-- !!!
+        print("Syntax:\n/way [map name|map number] x y [description]")
+        print("Example:\n/way Orgrimmar 52.5 12.3\n/way 85 52.5 12.3\n/way Ogrimmar - Cleft of Shadows 65.23 7\n/way Nagrand:Outland 84 61")
         if current_waypoint then
-            print(current_waypoint.string) -- !!!
+            print("Current waypoint: " .. current_waypoint.string)
         end
     end
 end
@@ -1137,10 +1191,9 @@ local function waym()
 end
 
 -- Clear waypoint
--- !!! should probably have wayc list to clear the list, and wayc all to clear the list AND the waypoint (will need to do something so we only play one clear sound if clearing multiple pins)
 local function wayc()
     if current_waypoint then
-        -- !!! get a string to display to the player about the waypoint they're clearing
+        print("Cleared waypoint: " .. current_waypoint.string)
         clear_waypoint()
     end
 end
@@ -1291,7 +1344,6 @@ end
 local function on_player_logout()
     if saved_variables.save_logout_waypoint and current_waypoint then
         saved_variables_per_character.logout_waypoint = current_waypoint
-        saved_variables_per_character.logout_supertrack = C_SuperTrack.IsSuperTrackingUserWaypoint()
     end
 
     saved_variables_per_character.history = waypoint_history_save()
@@ -1449,10 +1501,7 @@ end
 
 
 
-
-
 local function on_addon_loaded()
-
     -- Default options
     local default_saved_variables = {
         prefix = "way",
@@ -1490,85 +1539,6 @@ local function on_addon_loaded()
     -- Build the Interface options panel
     build_options_menu()
 
-    -- Add hooks that depend on options
-    -- Clear active pin when user comes within user-defined distance
-    hooksecurefunc(SuperTrackedFrame, "UpdateDistanceText", function ()
-        if saved_variables.automatic_clear then
-            local distance = C_Navigation.GetDistance()
-            if distance > 0 and distance <= saved_variables.clear_distance then
-                clear_waypoint()
-            end
-        end
-    end)
-
-    -- More useful Map Pin tooltips
-    do
-        local function update_waypoint_tooltip()
-            GameTooltip_SetTitle(GameTooltip, current_waypoint.desc or "Map Pin", NORMAL_FONT_COLOR)
-            local distance = C_Navigation.GetDistance()
-            if distance > 0 then
-                GameTooltip_AddColoredLine(GameTooltip, format("%d |4yard:yards away", floor(C_Navigation.GetDistance())), WHITE_FONT_COLOR)
-            end
-            GameTooltip_AddColoredLine(GameTooltip, current_waypoint.string, LIGHTGRAY_FONT_COLOR)
-            GameTooltip_AddInstructionLine(GameTooltip, "<Shift-Click to share pin in chat>")
-            GameTooltip_AddInstructionLine(GameTooltip, MAP_PIN_REMOVE)
-            GameTooltip:Show()
-        end
-
-        local in_waypoint_tooltip = false
-
-        hooksecurefunc(WaypointLocationPinMixin, "OnMouseEnter", function ()
-            in_waypoint_tooltip = true
-            if saved_variables.better_tooltips then
-                update_waypoint_tooltip()
-            end
-        end)
-
-        hooksecurefunc(WaypointLocationPinMixin, "OnMouseLeave", function ()
-            in_waypoint_tooltip = false
-        end)
-
-        GameTooltip:HookScript("OnUpdate", function ()
-            if in_waypoint_tooltip and saved_variables.better_tooltips then
-                if current_waypoint then
-                    update_waypoint_tooltip()
-                else
-                    -- Waypoint was cleared while the cursor was inside it
-                    in_waypoint_tooltip = false
-                end
-            end
-        end)
-    end
-
-    -- Custom min and max viewable distance for pins
-    -- GetTargetAlphaBaseValue only ends up setting widget alpha, so taint should not propagate
-    do
-        local old_GetTargetAlphaBaseValue = SuperTrackedFrame.GetTargetAlphaBaseValue
-        function SuperTrackedFrame:GetTargetAlphaBaseValue()
-            local alpha = old_GetTargetAlphaBaseValue(self)
-            local distance = C_Navigation.GetDistance()
-            local unlimited = saved_variables.unlimited_pin_distance
-            local min_distance = saved_variables.min_pin_distance
-            local max_distance = saved_variables.max_pin_distance
-            if not unlimited and distance > max_distance then
-                alpha = 0
-            elseif distance < min_distance then
-                alpha = 0
-            elseif alpha == 0 then
-                if distance > 500 then
-                    if unlimited or distance <= max_distance then
-                        alpha = 0.6
-                    end
-                else
-                    if distance >= min_distance then
-                        alpha = 1
-                    end
-                end
-            end
-            return alpha
-        end
-    end
-
     -- Set up slash commands
     do
         local slash_commands = {
@@ -1599,7 +1569,6 @@ local function on_addon_loaded()
             PLAYER_LOGOUT = on_player_logout,
             MINIMAP_PING = on_minimap_ping,
             SUPER_TRACKING_CHANGED = on_super_tracking_changed,
-            USER_WAYPOINT_UPDATED = on_user_waypoint_updated,
             PLAYER_REGEN_ENABLED = on_player_regen_enabled
         }
         for event, handler in pairs(events) do
@@ -1615,15 +1584,11 @@ local function on_addon_loaded()
         if saved_variables.save_logout_waypoint then
             local logout_waypoint = saved_variables_per_character.logout_waypoint
             if logout_waypoint then
-                current_waypoint = logout_waypoint
-                local position = current_waypoint.position
-                current_waypoint.position = CreateVector2D(position.x, position.y)
-                C_SuperTrack.SetSuperTrackedUserWaypoint(saved_variables_per_character.logout_supertrack) -- the game might overwrite this when quests load in, but that's fine
+                set_waypoint(logout_waypoint.uiMapID, logout_waypoint.position, logout_waypoint.desc)
             end
         end
     end
     saved_variables_per_character.logout_waypoint = nil
-    saved_variables_per_character.logout_supertrack = nil
 
     -- Restore waypoint history (must be after restore logout waypoint to avoid a duplicate history entry)
     waypoint_history_restore(saved_variables.history)
