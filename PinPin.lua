@@ -1,5 +1,3 @@
--- TODO: put in an issue for WorldQuestList because it tries to overwrite /way # # unless TomTom is installed
-
 local PLAYER = "player"
 
 local pinpin_frame = CreateFrame("Frame")
@@ -418,20 +416,29 @@ do
 end
 -- End Process Maps for Name and Data
 
--- do_after_combat(function, args...) to call protected functions once combat ends
-local do_after_combat, on_player_regen_enabled
+-- do_after_combat(preemptable, function, args...) to call protected functions once combat ends
+local do_after_combat, do_after_combat_preempt, on_player_regen_enabled
 do
     local to_do_after_combat = {}
 
     function on_player_regen_enabled() -- PLAYER_REGEN_ENABLED event detects end of combat
-        for func, args in pairs(to_do_after_combat) do
-            func(unpack(args))
+        for _, to_do in pairs(to_do_after_combat) do
+            to_do.func(unpack(to_do.args))
         end
         to_do_after_combat = {}
     end
 
     function do_after_combat(func, ...)
-        to_do_after_combat[func] = {...}
+        local handle = {}
+        to_do_after_combat[handle] = {func = func, args = {...}}
+        return handle
+    end
+
+    function do_after_combat_preempt(handle)
+        if not handle then
+            return
+        end
+        to_do_after_combat[handle] = nil
     end
 end
 
@@ -468,8 +475,6 @@ local function is_pin_visible_on_open_map()
     return x >= 0 and x <= 1 and y >= 0 and y <=1
 end
 
--- TODO: Add commands for accessing history
--- TODO: Can history display provide clickable pins?
 local waypoint_history_add, waypoint_history_last, waypoint_history_save, waypoint_history_restore
 do
     -- history is an array with a wrap-around index
@@ -526,7 +531,7 @@ local function longest_fractional_part_length(...)
     return places
 end
 
-local function get_waypoint_display_strings(waypoint)
+local function get_waypoint_string_subparts(waypoint)
     local MAX_DECIMAL_PLACES = 2
 
     local x = waypoint.position.x * 100
@@ -534,12 +539,22 @@ local function get_waypoint_display_strings(waypoint)
     local places = longest_fractional_part_length(x, y)
     places = min(places, MAX_DECIMAL_PLACES)
     local format_string = strconcat("%.", places, "f")
-    return map_id_to_unique_name[waypoint.uiMapID], format(format_string, x), format(format_string, y)
+    local map_name
+    if waypoint.proxy_for then
+        map_name = map_id_to_unique_name[waypoint.proxy_for]
+    else
+        map_name = map_id_to_unique_name[waypoint.uiMapID]
+    end
+    return map_name, format(format_string, x), format(format_string, y)
+end
+
+local function get_waypoint_string(waypoint)
+    local display_name, display_x, display_y = get_waypoint_string_subparts(current_waypoint)
+    return strconcat(display_name, " (", display_x, ", ", display_y, ")")
 end
 
 local function set_current_waypoint_string()
-    local display_name, display_x, display_y = get_waypoint_display_strings(current_waypoint)
-    current_waypoint.string = strconcat(display_name, " (", display_x, ", ", display_y, ")")
+    current_waypoint.string = get_waypoint_string(current_waypoint)
 end
 
 local refresh_waypoint_location_data_provider -- implemented in hooks
@@ -602,200 +617,222 @@ local function set_waypoint(map, position, desc)
     end
 end
 
--- Parses syntax for commands like /way and /wayl: [map name|map number] x y [description]
-local function parse_waypoint_command(msg)
+-- Parse map name
+-- returns map ID if it found exact match, otherwise prints potential matches and returns nil
+local function parse_map_name(input)
     local MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW = 7
 
-    if #msg > 0 then
-        -- Strip comma or period-separated coords ("8, 15" -> "8 15")
-        msg = msg:gsub("(%d)[.,] (%d)", "%1 %2", 1)
-
-        -- Deal with locale differences in decimal separators
-        local wrong_sep
-        local right_sep
-        if tonumber("1.1") == nil then -- this tonumber will return nil if locale doesn't use "." as decimal separator
-            right_sep = ","
-            wrong_sep = "."
-        else
-            right_sep = "."
-            wrong_sep = ","
-        end
-        local wrong_sep_pattern = strconcat("(%d)", wrong_sep, "(%d)")
-        local right_sep_pattern = strconcat("%1", right_sep, "%2")
-        msg = msg:gsub(wrong_sep_pattern, right_sep_pattern, 1)
-
-        local tokens = {}
-        for token in gmatch(msg, "%S+") do
-            tokens[#tokens + 1] = token
-        end
-
-        -- first number could be map number or the x coord
-        local first_number_pos
-        local first_number
-        for i, token in ipairs(tokens) do
-            local to_number = tonumber(token)
-            if to_number then
-                first_number_pos = i
-                first_number = to_number
-                break
-            end
-        end
-
-        if not first_number then
-            return nil
-        end
-
-        local second_number = tonumber(tokens[first_number_pos + 1]) -- second_number is x or y
-        if not second_number or second_number < 0 or second_number > 100 then
-            return nil
-        end
-
-        if first_number_pos ~= 1 then
-            -- user provided (map name, x, y)
-
-            if first_number < 0 or first_number > 100 then -- first number must be x coordinate, so range check it
-                return nil
-            end
-
-            local name_tokens = {}
-            for i = 1, first_number_pos - 1 do
-                name_tokens[#name_tokens + 1] = tokens[i]
-            end
-            local input_name = strlower(strjoin(" ", unpack(name_tokens)))
-
-            local matching_map_ids = {}
-            local db_probe = normalized_map_name_to_id[input_name]
-            if db_probe then
-                matching_map_ids = {db_probe}
+    local normed_input = strlower(input)
+    local matching_map_ids = {}
+    local exact_match = normalized_map_name_to_id[normed_input]
+    if exact_match then
+        return exact_match
+    else
+        -- partial matching
+        -- first try only prefixes (don't match "Greymane Manor:Ruins of Gilneas" on the input "Gilneas")
+        for db_name, db_map_id in pairs(normalized_map_name_to_id) do
+            local db_name_sep = strfind(db_name, MAP_SUFFIX_SEP, 1, true)
+            local prefix
+            if db_name_sep then
+                prefix = strsub(db_name, 1, db_name_sep - 1)
             else
-                -- partial matching
-                -- first try only prefixes (don't match "Greymane Manor:Ruins of Gilneas" on the input "Gilneas")
-                for db_name, db_map_id in pairs(normalized_map_name_to_id) do
-                    local db_name_sep = strfind(db_name, MAP_SUFFIX_SEP, 1, true)
-                    local prefix
-                    if db_name_sep then
-                        prefix = strsub(db_name, 1, db_name_sep - 1)
-                    else
-                        prefix = db_name
-                    end
-
-                    if strfind(prefix, input_name, 1, true) then
-                        matching_map_ids[#matching_map_ids + 1] = db_map_id
-                    end
-                end
-                -- try suffixes too
-                if #matching_map_ids == 0 then
-                    for db_name, db_map_id in pairs(normalized_map_name_to_id) do
-                        if strfind(gsub(db_name, MAP_SUFFIX_SEP, ":", 1), input_name, 1, true) then -- front-end separators are ":"
-                            matching_map_ids[#matching_map_ids + 1] = db_map_id
-                        end
-                    end
-                end
+                prefix = db_name
             end
 
-            -- Handle bad/ambiguous map inputs
-            if #matching_map_ids > 1 then
-                if #matching_map_ids > MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW then
-                    print(#matching_map_ids .. " possible matches for zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Top results:")
-                else
-                    print(#matching_map_ids .. " possible matches for zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Did you mean:")
-                end
-
-                local matching_map_names = {}
-                for _, id in ipairs(matching_map_ids) do
-                    matching_map_names[#matching_map_names + 1] = map_id_to_unique_name[id]
-                end
-                sort(matching_map_names,
-                     function (a, b)
-                         return #a < #b
-                     end
-                )
-                for i = 1, min(MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW, #matching_map_ids) do
-                    print(matching_map_names[i]) -- TODO: can we offer clickables?
-                end
-
-                return nil
-
-            elseif #matching_map_ids == 0 then
-                -- do a fuzzy search and show the best guesses for the map
-                print("Couldn't find zone \"" .. strjoin(" ", unpack(name_tokens)) .. "\". Did you mean:")
-                local fuzzy_matching_map_names = {}
-                local input_name_length = #input_name
-                for name, id in pairs(normalized_map_name_to_id) do
-                    local name_length = #name
-                    local length_diff = name_length - input_name_length
-                    local edit_distance = CalculateStringEditDistance(input_name, gsub(name, MAP_SUFFIX_SEP, ":", 1))
-                    if length_diff > 0 then
-                        edit_distance = edit_distance - length_diff -- remove penalty for insertions
-                    end
-                    if edit_distance < input_name_length then
-                        fuzzy_matching_map_names[#fuzzy_matching_map_names + 1] = {id, edit_distance, name_length}
-                    end
-                end
-
-                -- Sort by edit distance
-                sort(fuzzy_matching_map_names,
-                     function (a,b)
-                         if a[2] < b[2] then
-                             return true
-                         elseif a[2] > b[2] then
-                             return false
-                         else
-                             -- if equal edit distance, then favor the shorter one
-                             return a[3] < b[3]
-                         end
-                     end
-                )
-
-                for i = 1, min(#fuzzy_matching_map_names, MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW) do
-                    local id = fuzzy_matching_map_names[i][1]
-                    print(map_id_to_unique_name[id]) -- TODO: Can we offer clickables?
-                end
-                return nil
+            if strfind(prefix, normed_input, 1, true) then
+                matching_map_ids[#matching_map_ids + 1] = db_map_id
             end
-
-            -- we have a map, x, and y
-            local desc_tokens = {}
-            for i = first_number_pos + 2, #tokens do
-                desc_tokens[#desc_tokens + 1] = tokens[i]
+        end
+        -- try suffixes too
+        if #matching_map_ids == 0 then
+            for db_name, db_map_id in pairs(normalized_map_name_to_id) do
+                if strfind(gsub(db_name, MAP_SUFFIX_SEP, ":", 1), normed_input, 1, true) then -- front-end separators are ":"
+                    matching_map_ids[#matching_map_ids + 1] = db_map_id
+                end
             end
-            return {uiMapID = matching_map_ids[1], position = CreateVector2D(first_number / 100, second_number / 100), desc = strconcat(unpack(desc_tokens))}
+        end
+    end
+
+    -- Handle bad/ambiguous map inputs
+    if #matching_map_ids > 1 then
+        if #matching_map_ids > MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW then
+            print(#matching_map_ids .. " possible matches for zone \"" .. input .. "\". Top results:")
         else
-            -- user either provided (numerical map, x, y) or just (x, y)
-            local third_number = tonumber(tokens[first_number_pos + 2])
-            if third_number and third_number >= 0 and third_number <= 100 then
-                -- user entered (numerical map, x, y)
-                local desc_tokens = {}
-                for i = first_number_pos + 3, #tokens do
-                    desc_tokens[#desc_tokens + 1] = tokens[i]
-                end
-                local desc
-                if #desc_tokens > 0 then
-                    desc = strconcat(unpack(desc_tokens))
-                end
-                return {uiMapID = first_number, position = CreateVector2D(second_number / 100, third_number / 100), desc = desc}
-            elseif first_number >= 0 and first_number <= 100 then -- first number must be x coordinate, so range check it
-                -- user entered just (x, y)
-                local desc_tokens = {}
-                for i = first_number_pos + 2, #tokens do
-                    desc_tokens[#desc_tokens + 1] = tokens[i]
-                end
-                local desc
-                if #desc_tokens > 0 then
-                    desc = strconcat(unpack(desc_tokens))
-                end
-                -- if their map is open, pin to the zone they're open to
-                if WorldMapFrame:IsVisible() then
-                    return {uiMapID = WorldMapFrame:GetMapID(), position = CreateVector2D(first_number / 100, second_number / 100), desc = desc}
-                end
-                -- if map is closed, pin in the zone the player is currently in
-                return {uiMapID = C_Map.GetBestMapForUnit(PLAYER), position = CreateVector2D(first_number / 100, second_number / 100), desc = desc}
+            print(#matching_map_ids .. " possible matches for zone \"" .. input .. "\". Did you mean:")
+        end
+
+        local matching_map_names = {}
+        for _, id in ipairs(matching_map_ids) do
+            matching_map_names[#matching_map_names + 1] = map_id_to_unique_name[id]
+        end
+        sort(matching_map_names,
+             function (a, b)
+                 return #a < #b
+             end
+        )
+        for i = 1, min(MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW, #matching_map_ids) do
+            print(matching_map_names[i])
+        end
+    elseif #matching_map_ids == 0 then
+        -- do a fuzzy search and show the best guesses for the map
+        print("Couldn't find zone \"" .. input .. "\". Did you mean:")
+        local fuzzy_matching_map_names = {}
+        local input_length = #normed_input
+        for name, id in pairs(normalized_map_name_to_id) do
+            local name_length = #name
+            local length_diff = name_length - input_length
+            local edit_distance = CalculateStringEditDistance(normed_input, gsub(name, MAP_SUFFIX_SEP, ":", 1))
+            if length_diff > 0 then
+                edit_distance = edit_distance - length_diff -- remove penalty for insertions
             end
+            if edit_distance < input_length then
+                fuzzy_matching_map_names[#fuzzy_matching_map_names + 1] = {id, edit_distance, name_length}
+            end
+        end
+
+        -- Sort by edit distance
+        sort(fuzzy_matching_map_names,
+             function (a,b)
+                 if a[2] < b[2] then
+                     return true
+                 elseif a[2] > b[2] then
+                     return false
+                 else
+                     -- if equal edit distance, then favor the shorter one
+                     return a[3] < b[3]
+                 end
+             end
+        )
+
+        for i = 1, min(#fuzzy_matching_map_names, MAX_AMBIGUOUS_MAP_NAMES_TO_SHOW) do
+            local id = fuzzy_matching_map_names[i][1]
+            print(map_id_to_unique_name[id])
         end
     end
 end
 
---Begin Hooks
+local function waypoint_command_syntax()
+    local slash_prefix = saved_variables.prefix
+    print("Syntax:\n/" .. slash_prefix .. " [map name|map number] x y [description]")
+    print("Examples:\n/" .. slash_prefix .. " Orgrimmar 52.5 12.3\n/"
+                         .. slash_prefix .. " 85 52.5 12.3\n/"
+                         .. slash_prefix .. " Ogrimmar - Cleft of Shadows 65.23 7\n/"
+                         .. slash_prefix .. " Nagrand:Outland 84 61")
+end
+
+-- Parses syntax for commands like /way and /wayl: [map name|map number] x y [description]
+-- returns uiMapPoint and desc if unambiguous, otherwise nil
+local function parse_waypoint_command(msg)
+    if #msg == 0 then
+        print("For help: /" .. saved_variables.prefix .. "help")
+        waypoint_command_syntax()
+        return
+    end
+
+    -- Strip comma or period-separated coords ("8, 15" -> "8 15")
+    msg = msg:gsub("(%d)[.,] (%d)", "%1 %2", 1)
+
+    -- Deal with locale differences in decimal separators
+    local wrong_sep
+    local right_sep
+    if tonumber("1.1") == nil then -- this tonumber will return nil if locale doesn't use "." as decimal separator
+        right_sep = ","
+        wrong_sep = "."
+    else
+        right_sep = "."
+        wrong_sep = ","
+    end
+    local wrong_sep_pattern = strconcat("(%d)", wrong_sep, "(%d)")
+    local right_sep_pattern = strconcat("%1", right_sep, "%2")
+    msg = msg:gsub(wrong_sep_pattern, right_sep_pattern, 1)
+
+    local tokens = {}
+    for token in gmatch(msg, "%S+") do
+        tokens[#tokens + 1] = token
+    end
+
+    -- first number could be map number or the x coord
+    local first_number_pos
+    local first_number
+    for i, token in ipairs(tokens) do
+        local to_number = tonumber(token)
+        if to_number then
+            first_number_pos = i
+            first_number = to_number
+            break
+        end
+    end
+
+    if not first_number then
+        waypoint_command_syntax()
+        return
+    end
+
+    local second_number = tonumber(tokens[first_number_pos + 1]) -- second_number is x or y
+    if not second_number or second_number < 0 or second_number > 100 then
+        waypoint_command_syntax()
+        return
+    end
+
+    if first_number_pos ~= 1 then
+        -- user provided (map name, x, y)
+
+        if first_number < 0 or first_number > 100 then -- first number must be x coordinate
+            waypoint_command_syntax()
+            return
+        end
+
+        local name_tokens = {}
+        for i = 1, first_number_pos - 1 do
+            name_tokens[#name_tokens + 1] = tokens[i]
+        end
+        local input_name = strjoin(" ", unpack(name_tokens))
+
+        local exact_match = parse_map_name(input_name)
+        if not exact_match then
+            return
+        end
+
+        local desc_tokens = {}
+        for i = first_number_pos + 2, #tokens do
+            desc_tokens[#desc_tokens + 1] = tokens[i]
+        end
+
+        return {uiMapID = exact_match, position = CreateVector2D(first_number / 100, second_number / 100), desc = strconcat(unpack(desc_tokens))}
+    else
+        -- user either provided (numerical map, x, y) or just (x, y)
+        local third_number = tonumber(tokens[first_number_pos + 2])
+        if third_number and third_number >= 0 and third_number <= 100 then
+            -- user entered (numerical map, x, y)
+            local desc_tokens = {}
+            for i = first_number_pos + 3, #tokens do
+                desc_tokens[#desc_tokens + 1] = tokens[i]
+            end
+            local desc
+            if #desc_tokens > 0 then
+                desc = strconcat(unpack(desc_tokens))
+            end
+            return {uiMapID = first_number, position = CreateVector2D(second_number / 100, third_number / 100), desc = desc}
+        elseif first_number >= 0 and first_number <= 100 then -- first number must be x coordinate
+            -- user entered just (x, y)
+            local desc_tokens = {}
+            for i = first_number_pos + 2, #tokens do
+                desc_tokens[#desc_tokens + 1] = tokens[i]
+            end
+            local desc
+            if #desc_tokens > 0 then
+                desc = strconcat(unpack(desc_tokens))
+            end
+            -- if their map is open, pin to the zone they're open to
+            if WorldMapFrame:IsVisible() then
+                return {uiMapID = WorldMapFrame:GetMapID(), position = CreateVector2D(first_number / 100, second_number / 100), desc = desc}
+            end
+            -- if map is closed, pin in the zone the player is currently in
+            return {uiMapID = C_Map.GetBestMapForUnit(PLAYER), position = CreateVector2D(first_number / 100, second_number / 100), desc = desc}
+        end
+    end
+end
+
 -- paste_in_chat(text)
 -- Hook OnEnterPressed then paste into chat (for commands that fill text into edit box, letting the user edit and send with Enter normally)
 local paste_in_chat
@@ -820,47 +857,6 @@ do
         keeping_focus = true
     end
 end
-
--- !!! TODO: Handle clicks to hyperlinks! Needs to set current_map correctly. Hyperlinks can go to pinpin-only maps!
--- TODO: Add sounds for pin placement (doesn't need pin removal - clicking a hyperlink opens you up to the map with the pin on it anyway)
--- For clicks to chat waypoint links, use adjacent text for the waypoint desc (looks for text to the right of the link first)
-hooksecurefunc("ChatFrame_OnHyperlinkShow", function (self, link, text)
-    if strsub(link, 1, 8) == "worldmap" then
-        local map_point = C_Map.GetUserWaypointFromHyperlink(link)
-        if map_point and C_Map.CanSetUserWaypointOnMap(map_point.uiMapID) then -- TODO: is it even possible to generate map hyperlinks to maps we can't place pins on? If it is, we should handle those better anyway
-            -- Blizzard didn't bother to add sounds for this if the map is open, so let's add them
-            if is_pin_visible_on_open_map() then
-                PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CLICK_TO_PLACE, nil, SOUNDKIT_ALLOW_DUPLICATES)
-            end
-            -- Search through the chat frame for the message
-            for i = self:GetNumMessages(), 1, -1 do
-                local chat_text = self:GetMessageInfo(i)
-                local start_pos, end_pos = strfind(chat_text, text, 1, true)
-                if end_pos then
-                    -- First see if there's any text we can use to the right of the hyperlink
-                    local right = strtrim(strsub(chat_text, end_pos + 1))
-                    if right == "" then
-                        -- No text to the right, so check for text to the left
-                        local left = strtrim(strsub(chat_text, 1, start_pos - 1))
-                        local left_strip_hyperlinks = select(4, ExtractHyperlinkString(left))
-                        if left_strip_hyperlinks then
-                            local colon_pos = strfind(left_strip_hyperlinks, ":", 1, true)
-                            if colon_pos then
-                                left = strtrim(strsub(left_strip_hyperlinks, colon_pos + 1))
-                            end
-                        end
-                        if left ~= "" then
-                            current_waypoint.desc = left
-                        end
-                    else
-                        current_waypoint.desc = right
-                    end
-                    break
-                end
-            end
-        end
-    end
-end)
 
 -- Clear active pin when user comes within user-defined distance
 hooksecurefunc(SuperTrackedFrame, "UpdateDistanceText", function ()
@@ -973,12 +969,60 @@ do
     --     the data provider click handler deals with adding and removing pins
 
     hooksecurefunc(WaypointLocationPinMixin, "OnMouseClickAction", function ()
-        -- No point supertracking pins that require PinPin, and we can't share them normally
         if current_waypoint.requires_pinpin then
             if IsModifiedClick("CHATLINK") then
-                -- TODO: Generate the link, but warn them that non-pinpin users can't use it
+                -- trying to create a chat link
+                print("Pinning to that map requires PinPin. Are you sure you want to share the pin?")
+                local x = floor(current_waypoint.position.x * 10000)
+                local y = floor(current_waypoint.position.y * 10000)
+                local to_paste = strconcat("|cffffff00|Hworldmap:", current_waypoint.uiMapID, ":", x, ":", y, "|h[", MAP_PIN_HYPERLINK, "]|h|r")
+                to_paste = strjoin(" ", current_waypoint.string, to_paste)
+                local desc = current_waypoint.desc
+                if desc then
+                    to_paste = strjoin(" ", to_paste, desc)
+                end
+                to_paste = to_paste .. " (requires PinPin)"
+                ChatEdit_InsertLink(to_paste)
+                PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CHAT_SHARE, nil, SOUNDKIT_ALLOW_DUPLICATES)
             elseif mouse_button == "LeftButton" then
-                print("This map pin is PinPin-only, and can't be supertracked.")
+                -- trying to supertrack
+                print("This map pin is PinPin-only and can't be supertracked.")
+            end
+        else
+            -- better text for linking regular waypoints
+            if IsModifiedClick("CHATLINK") then
+                local edit_box = LAST_ACTIVE_CHAT_EDIT_BOX
+                local text = edit_box:GetText()
+                if text == "" then
+                    return
+                end
+
+                local link_start_probe = "|cffffff00|Hworldmap:"
+                local link_start, link_start_last_char = strfind(text, link_start_probe, 1, true)
+                if not link_start then
+                    return
+                end
+                local link_end_probe = strconcat("|h[", MAP_PIN_HYPERLINK, "]|h|r")
+                local _, link_end = strfind(text, link_end_probe, link_start_last_char, true)
+
+                local prefix = strtrim(strsub(text, 1, link_start - 1))
+                local hyperlink = strsub(text, link_start, link_end)
+                local suffix = strtrim(strsub(text, link_end + 1))
+                local desc = current_waypoint.desc
+
+                to_join = {}
+                if prefix then
+                    to_join[#to_join + 1] = prefix
+                end
+                to_join[#to_join + 1] = current_waypoint.string
+                to_join[#to_join + 1] = hyperlink
+                if desc then
+                    to_join[#to_join + 1] = desc
+                end
+                if suffix then
+                    to_join[#to_join + 1] = suffix
+                end
+                edit_box:SetText(table.concat(to_join, " "))
             end
         end
     end)
@@ -1072,7 +1116,141 @@ do
         GameTooltip:Show()
     end)
 end
--- End Hooks
+
+-- Handle clicks to chat waypoint links
+hooksecurefunc("ChatFrame_OnHyperlinkShow", function (self, link, text)
+    if strsub(link, 1, 8) == "worldmap" then
+        local map_point = C_Map.GetUserWaypointFromHyperlink(link)
+        if not map_point then
+            return
+        end
+
+        if C_Map.CanSetUserWaypointOnMap(map_point.uiMapID) then
+            -- we're dealing with native pins
+            current_waypoint = C_Map.GetUserWaypoint()
+            set_current_waypoint_string()
+
+            -- Blizzard didn't bother to add the sound for this
+            if is_pin_visible_on_open_map() then
+                PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CLICK_TO_PLACE, nil, SOUNDKIT_ALLOW_DUPLICATES)
+            end
+
+            if saved_variables.semi_automatic_supertrack_pins and (saved_variables.automatic_supertrack_pins or not C_SuperTrack.IsSuperTrackingAnything()) then
+                C_SuperTrack.SetSuperTrackedUserWaypoint(true)
+            end
+        else
+            -- we're pinning to a map that requires a proxy or requires_pinpin
+            set_waypoint(map_point.uiMapID, map_point.position)
+        end
+
+        -- Try to get a desc from the right or left of the hyperlink in chat
+        -- Search through the chat frame for the message
+        for i = self:GetNumMessages(), 1, -1 do
+            local chat_text = self:GetMessageInfo(i)
+            local link_start, link_end = strfind(chat_text, text, 1, true)
+            if link_start then
+                -- First see if there's any text we can use to the right of the hyperlink
+                local right = strtrim(strsub(chat_text, link_end + 1))
+                if right ~= "" then
+                    current_waypoint.desc = right
+                else
+                    -- No text to the right, so check for text to the left
+                    local left = strsub(chat_text, 1, link_start - 1)
+                    -- left text includes time stamps, character names, etc. The first hyperlink should be the speaker.
+                    local _, left_junk_end = strfind(left, "^.-|H.+|h")
+                    if left_junk_end then
+                        left = strsub(left, left_junk_end + 1)
+                    end
+                    --remaining junk should end with a colon (e.g., " says: ")
+                    local colon_pos = strfind(left, ":", 1, true)
+                    if colon_pos then
+                        left = strsub(left, colon_pos + 1)
+                    end
+                    left = strtrim(left)
+                    if left ~= "" then
+                        current_waypoint.desc = left
+                    end
+                end
+                break
+            end
+        end
+    end
+end)
+
+local waym
+do
+    local open_map_frame_to_map_id
+    local open_map_frame_to_waypoint = false
+    local open_map_frame_do_after_combat_handle
+
+    -- display map potentially delayed due to combat
+    WorldMapFrame:HookScript("OnShow", function (self)
+        if open_map_frame_to_map_id then
+            WorldMapFrame:SetMapID(open_map_frame_to_map_id)
+            open_map_frame_to_map_id = nil
+            do_after_combat_preempt(open_map_frame_do_after_combat_handle)
+        elseif open_map_frame_to_waypoint then
+            if current_waypoint then
+                WorldMapFrame:SetMapID(current_waypoint.uiMapID)
+            else
+                print("There aren't any pins on the map.")
+            end
+            open_map_frame_to_waypoint = false
+            do_after_combat_preempt(open_map_frame_do_after_combat_handle)
+        end
+    end)
+
+    -- if provided with a map name or ID, opens to that map
+    -- otherwise, open map to current waypoint
+    waym = function (msg)
+        local map
+
+        local specified_a_map = msg ~= ""
+        if specified_a_map then
+            local map_num = tonumber(msg)
+            if map_num and map_num == floor(map_num) then
+                map = map_num
+            else
+                local msg_norm_spaces = gsub(msg, "%s", " ")
+                local exact_match = parse_map_name(msg_norm_spaces)
+                if exact_match then
+                    map = exact_match
+                else
+                    return
+                end
+            end
+        else
+            if current_waypoint then
+                map = current_waypoint.uiMapID
+            else
+                print("There aren't any pins on the map.")
+                return
+            end
+        end
+        
+        if WorldMapFrame:IsVisible() then
+            WorldMapFrame:SetMapID(map)
+            return
+        end
+
+        -- set upvalues for WorldMapFrame:Show()
+        open_map_frame_to_waypoint = not specified_a_map
+        if specified_a_map then
+            open_map_frame_to_map_id = map
+        else
+            open_map_frame_to_map_id = nil
+        end
+
+        if InCombatLockdown() then
+            -- addons can't open UI panels like the map during combat
+            print("Map will open after combat.")
+            do_after_combat_preempt(open_map_frame_do_after_combat_handle)
+            open_map_frame_do_after_combat_handle = do_after_combat(OpenWorldMap)
+        else
+            OpenWorldMap()
+        end
+    end
+end
 
 -- Begin Commands
 -- Set a user-specified waypoint, /way [map name|map number] x y [description]
@@ -1080,138 +1258,220 @@ local function way(msg)
     local waypoint = parse_waypoint_command(msg)
     if waypoint then
         set_waypoint(waypoint.uiMapID, waypoint.position, waypoint.desc)
-    else
-        print("Syntax:\n/way [map name|map number] x y [description]")
-        print("Example:\n/way Orgrimmar 52.5 12.3\n/way 85 52.5 12.3\n/way Ogrimmar - Cleft of Shadows 65.23 7\n/way Nagrand:Outland 84 61")
-        if current_waypoint then
-            print("Current waypoint: " .. current_waypoint.string)
-        end
     end
 end
 
 -- Waypoint at player position ("way back")
 local function wayb()
     local map = C_Map.GetBestMapForUnit(PLAYER)
-    -- !!! won't work if we're in an instance map since we can't get player position - need to error out
-    set_waypoint(map, C_Map.GetPlayerMapPosition(map, PLAYER), "Wayback")
-end
-
--- TODO: Allow /waym [map name] or /waym [map number] to just open the map to a specific map
--- open map to current waypoint
-local function waym()
-    if current_waypoint then
-        local map = current_waypoint.uiMapID
-        if WorldMapFrame:IsVisible() then
-            WorldMapFrame:SetMapID(map)
-        elseif InCombatLockdown() then
-            do_after_combat(waym)
-        else
-            OpenWorldMap(map)
-        end
-    else
-        -- !!! send the player an error message
+    local pos = C_Map.GetPlayerMapPosition(map, PLAYER)
+    if not pos then
+        print("Cannot get player position for this map.")
+        return
     end
+    set_waypoint(map, pos, "Way Back")
 end
 
 -- Clear waypoint
 local function wayc()
     if current_waypoint then
-        print("Cleared waypoint: " .. current_waypoint.string)
+        print("Cleared map pin: " .. current_waypoint.string)
         clear_waypoint()
     end
 end
 
 -- Generate a link using way syntax or a link to the current waypoint, /wayl [[map name|map number] x y [description]]
 local function wayl(msg)
-    local waypoint = parse_waypoint_command(msg) or current_waypoint
-    if waypoint then
-        local x = floor(waypoint.position.x * 10000)
-        local y = floor(waypoint.position.y * 10000)
-        local to_paste = strconcat("|cffffff00|Hworldmap:", waypoint.uiMapID, ":", x, ":", y, "|h[", MAP_PIN_HYPERLINK, "]|h|r") -- server rejects links with text other than "Map Pin" (MAP_PIN_HYPERLINK)
-        local desc = waypoint.desc
-        if desc then
-            to_paste = strjoin(" ", to_paste, desc)
+    local waypoint
+
+    if msg ~= "" then
+        waypoint = parse_waypoint_command(msg)
+        if not waypoint then
+            return
         end
-        paste_in_chat(to_paste)
+        waypoint.string = get_waypoint_string(waypoint)
     else
-        print("Some kind of error message") -- !!!
+        waypoint = current_waypoint
+        if not waypoint then
+            print("There aren't any pins on the map.")
+            return
+        end
     end
+
+    local map = waypoint.uiMapID
+    local map_data = map_id_to_data(map)
+    if map_data.requires_pinpin then
+        print("Pinning to that map requires PinPin. Are you sure you want to share the pin?")
+    end
+    local proxy = map_data.proxy
+    if proxy then
+        local instance, world_pos = C_Map.GetWorldPosFromMapPos(map, waypoint.position)
+        local map_pos = select(2, C_Map.GetMapPosFromWorldPos(instance, world_pos, proxy))
+        waypoint.uiMapID = proxy
+        waypoint.position.x = map_pos.x
+        waypoint.position.y = map_pos.y
+    end
+
+    local x = floor(waypoint.position.x * 10000)
+    local y = floor(waypoint.position.y * 10000)
+    local to_paste = strconcat("|cffffff00|Hworldmap:", waypoint.uiMapID, ":", x, ":", y, "|h[", MAP_PIN_HYPERLINK, "]|h|r") -- server rejects links with text other than "Map Pin" (MAP_PIN_HYPERLINK)
+    to_paste = strjoin(" ", waypoint.string, to_paste)
+    local desc = waypoint.desc
+    if desc then
+        to_paste = strjoin(" ", to_paste, desc)
+    end
+    if current_waypoint.requires_pinpin then
+        to_paste = to_paste .. " (requires PinPin)"
+    end
+    paste_in_chat(to_paste)
+    PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CHAT_SHARE, nil, SOUNDKIT_ALLOW_DUPLICATES)
 end
 
--- !!!
--- /wayr (maybe something else?)
--- given a /way, generate a copy-able /run command for people without the addon
-local function get_waypoint_run_string(waypoint)
-    return strconcat("/run C_Map.SetUserWaypoint(", waypoint.uiMapID, ",", waypoint.position.x, ",", waypoint.position.y, ")")
+-- generate a copy-able /run command for people without the addon
+local function wayr(msg)
+    local waypoint
+
+    if msg ~= "" then
+        waypoint = parse_waypoint_command(msg)
+        if not waypoint then
+            return
+        end
+        waypoint.string = get_waypoint_string(waypoint)
+    else
+        waypoint = current_waypoint
+        if not waypoint then
+            print("There aren't any pins on the map.")
+            return
+        end
+    end
+
+    local map = waypoint.uiMapID
+    local map_data = map_id_to_data(map)
+    if map_data.requires_pinpin then
+        print("Pinning to that map requires PinPin. It can't be shared via a /run command.")
+        return
+    end
+    local proxy = map_data.proxy
+    if proxy then
+        local instance, world_pos = C_Map.GetWorldPosFromMapPos(map, waypoint.position)
+        local map_pos = select(2, C_Map.GetMapPosFromWorldPos(instance, world_pos, proxy))
+        waypoint.uiMapID = proxy
+        waypoint.position.x = map_pos.x
+        waypoint.position.y = map_pos.y
+    end
+
+    paste_in_chat(strconcat(" /run C_Map.SetUserWaypoint({uiMapID=", waypoint.uiMapID, ",position={x=", format("%.4f", waypoint.position.x), ",y=", format("%.4f", waypoint.position.y), "}})"))
 end
 
--- Link a waypoint to the target and some target info in chat
+-- Link a waypoint pointing to the target and some target info in chat
 local function wayt()
     local TARGET = "target"
     local map = C_Map.GetBestMapForUnit(PLAYER)
-    if can_set_waypoint(map) then
-        if UnitExists(TARGET) then
-            -- If it's a rare with a map marker visible, we can get its actual position
-            local target_guid = UnitGUID(TARGET)
-            local vignette_guids = C_VignetteInfo.GetVignettes()
-            local target_position
-            for _, vignette_guid in ipairs(vignette_guids) do
-                if C_VignetteInfo.GetVignetteInfo(vignette_guid).objectGUID == target_guid then
-                    target_position = C_VignetteInfo.GetVignettePosition(vignette_guid, map)
-                    break
-                end
-            end
-            local x, y
-            if target_position then
-                x, y = target_position:GetXY()
-            else
-                -- Just use the player's position
-                x, y = C_Map.GetPlayerMapPosition(map, PLAYER):GetXY()
-            end
-            x = floor(x * 10000)
-            y = floor(y * 10000)
-            local target_name = UnitName(TARGET)
-            local target_health_proportion = UnitHealth(TARGET) / UnitHealthMax(TARGET)
-            local target_health
-            if target_health_proportion == 0 then
-                target_health = 0
-            else
-                -- Default to one decimal place, but if health < .1%, then show as many decimals as necessary so we never show 0% when things aren't dead yet
-                local multiplier = 100
-                repeat
-                    multiplier = multiplier * 10
-                    target_health = floor(target_health_proportion * multiplier) / (multiplier / 100)
-                until target_health > 0
-            end
-            paste_in_chat(strconcat("|cffffff00|Hworldmap:", map, ":", x, ":", y, "|h[|A:Waypoint-MapPin-ChatIcon:13:13:0:0|a Map Pin Location]|h|r ", target_name, " (", target_health, "%)"))
-        else
-            -- !!! error message, no target
+
+    if not UnitExists(TARGET) then
+        print("You have no target.")
+        return
+    end
+
+    -- get target health percentage
+    local target_name = UnitName(TARGET)
+    local target_health_proportion = UnitHealth(TARGET) / UnitHealthMax(TARGET)
+    local target_health
+    if target_health_proportion == 0 then
+        target_health = 0
+    else
+        -- Default to one decimal place, but if health < .1%, then show as many decimals as necessary so we never show 0% when things aren't dead yet
+        local multiplier = 100
+        repeat
+            multiplier = multiplier * 10
+            target_health = floor(target_health_proportion * multiplier) / (multiplier / 100)
+        until target_health > 0
+    end
+
+    -- If it's a rare with a map marker visible, we can get its actual position
+    local target_guid = UnitGUID(TARGET)
+    local vignette_guids = C_VignetteInfo.GetVignettes()
+    local target_position
+    for _, vignette_guid in ipairs(vignette_guids) do
+        if C_VignetteInfo.GetVignetteInfo(vignette_guid).objectGUID == target_guid then
+            target_position = C_VignetteInfo.GetVignettePosition(vignette_guid, map)
+            break
         end
     end
+    local x, y
+    if target_position then
+        x, y = target_position:GetXY()
+    else
+        -- Just use the player's position
+        local player_pos = C_Map.GetPlayerMapPosition(map, PLAYER)
+        if not player_pos then
+            print("Can't generate pin for this target (usually because you are in an instance).")
+            paste_in_chat(strconcat(target_name, " (", target_health, "%)"))
+            return
+        end
+        x, y = player_pos:GetXY()
+    end
+
+    local map_data = map_id_to_data(map)
+    if map_data.requires_pinpin then
+        print("Pinning to that map requires PinPin. Are you sure you want to share the pin?")
+    end
+    local proxy = map_data.proxy
+    if proxy then
+        local instance, world_pos = C_Map.GetWorldPosFromMapPos(map, CreateVector2D(x, y))
+        local map_pos = select(2, C_Map.GetMapPosFromWorldPos(instance, world_pos, proxy))
+        map = proxy
+        x = map_pos.x
+        y = map_pos.y
+    end
+
+    x = floor(x * 10000)
+    y = floor(y * 10000)
+
+    paste_in_chat(strconcat("|cffffff00|Hworldmap:", map, ":", x, ":", y, "|h[|A:Waypoint-MapPin-ChatIcon:13:13:0:0|a Map Pin Location]|h|r ", target_name, " (", target_health, "%)"))
+    PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CHAT_SHARE, nil, SOUNDKIT_ALLOW_DUPLICATES)
 end
 
 -- Paste a waypoint link to the player's position into chat
 local function wayme()
     local map = C_Map.GetBestMapForUnit(PLAYER)
-    if can_set_waypoint(map) then
-        local x, y = C_Map.GetPlayerMapPosition(map, PLAYER):GetXY()
-        x = floor(x * 10000)
-        y = floor(y * 10000)
-        local player_name = UnitName(PLAYER) -- UnitName has two returns, so save here to avoid strjoin including the second return too
-        paste_in_chat(strconcat("|cffffff00|Hworldmap:", map, ":", x, ":", y, "|h[", MAP_PIN_HYPERLINK, "]|h|r ", player_name))
+    local pos = C_Map.GetPlayerMapPosition(map, PLAYER)
+    if not pos then
+        print("Player can't be located on this map (usually because you are in an instance).")
+        return
     end
+
+    local map_data = map_id_to_data(map)
+    if map_data.requires_pinpin then
+        print("Pinning to that map requires PinPin. Are you sure you want to share the pin?")
+    end
+    local proxy = map_data.proxy
+    if proxy then
+        local instance, world_pos = C_Map.GetWorldPosFromMapPos(map, pos)
+        local map_pos = select(2, C_Map.GetMapPosFromWorldPos(instance, world_pos, proxy))
+        map = proxy
+        pos = map_pos
+    end
+
+    local x, y = pos.x, pos.y
+    x = floor(x * 10000)
+    y = floor(y * 10000)
+    local player_name = UnitName(PLAYER)
+    paste_in_chat(strconcat("|cffffff00|Hworldmap:", map, ":", x, ":", y, "|h[", MAP_PIN_HYPERLINK, "]|h|r ", player_name))
+    PlaySound(SOUNDKIT.UI_MAP_WAYPOINT_CHAT_SHARE, nil, SOUNDKIT_ALLOW_DUPLICATES)
 end
 
 -- Waypoint supertrack toggle
 local function ways()
-    if current_waypoint then
-        local supertracking = not C_SuperTrack.IsSuperTrackingUserWaypoint()
-        C_SuperTrack.SetSuperTrackedUserWaypoint(supertracking)
-        if is_pin_visible_on_open_map() then
-            PlaySound(supertracking and SOUNDKIT.UI_MAP_WAYPOINT_SUPER_TRACK_ON or SOUNDKIT.UI_MAP_WAYPOINT_SUPER_TRACK_OFF, nil, SOUNDKIT_ALLOW_DUPLICATES)
-        end
-    else
-        -- !!!messageplayer "You don't have an active pin."
+    if not current_waypoint then
+        print("There aren't any pins on the map.")
+        return
+    end
+
+    local supertracking = not C_SuperTrack.IsSuperTrackingUserWaypoint()
+    C_SuperTrack.SetSuperTrackedUserWaypoint(supertracking)
+    if is_pin_visible_on_open_map() then
+        PlaySound(supertracking and SOUNDKIT.UI_MAP_WAYPOINT_SUPER_TRACK_ON or SOUNDKIT.UI_MAP_WAYPOINT_SUPER_TRACK_OFF, nil, SOUNDKIT_ALLOW_DUPLICATES)
     end
 end
 
@@ -1231,7 +1491,7 @@ do
             set_waypoint(last_minimap_ping.uiMapID, last_minimap_ping.position, "Minimap Ping")
         else
             if saw_first_ping then
-                print("PinPin can't locate pings inside instances.") -- !!! better error message
+                print("PinPin couldn't locate the last ping (usually because it was in an instance).")
             else
                 print("PinPin hasn't seen any pings yet.")
             end
@@ -1240,25 +1500,28 @@ do
 
     -- Event handler for MINIMAP_PING
     function on_minimap_ping(pinger, minimap_x, minimap_y)
+        saw_first_ping = true
         local map = C_Map.GetBestMapForUnit(PLAYER)
         local player_position = C_Map.GetPlayerMapPosition(map, PLAYER)
-        if player_position then
-            local player_x, player_y = player_position:GetXY()
-            if C_CVar.GetCVar("rotateMinimap") == "1" then
-                minimap_x, minimap_y = unrotate_minimap_coords(minimap_x, minimap_y)
-            end
-            local map_width, map_height = C_Map.GetMapWorldSize(map)
-            local minimap_radius = C_Minimap.GetViewRadius()
-            local map_x = player_x + minimap_x * minimap_radius / map_width
-            local map_y = player_y - minimap_y * minimap_radius / map_height
-            last_minimap_ping = UiMapPoint.CreateFromCoordinates(map, map_x, map_y)
+
+        if not player_position then
+            last_minimap_ping = nil
+            return
         end
-        saw_first_ping = true
+
+        local player_x, player_y = player_position:GetXY()
+        if C_CVar.GetCVar("rotateMinimap") == "1" then
+            minimap_x, minimap_y = unrotate_minimap_coords(minimap_x, minimap_y)
+        end
+        local map_width, map_height = C_Map.GetMapWorldSize(map)
+        local minimap_radius = C_Minimap.GetViewRadius()
+        local map_x = player_x + minimap_x * minimap_radius / map_width
+        local map_y = player_y - minimap_y * minimap_radius / map_height
+        last_minimap_ping = UiMapPoint.CreateFromCoordinates(map, map_x, map_y)
     end
 end
 
 local function super_tracking_changed()
-    print("Super tracking changed") -- !!!
     if not C_SuperTrack.IsSuperTrackingAnything() and current_waypoint and saved_variables.semi_automatic_supertrack_pins then
         C_SuperTrack.SetSuperTrackedUserWaypoint(true)
     end
@@ -1286,6 +1549,8 @@ end
 
 
 
+
+-- !!! make the names of the commands in the reference highlighted and clickable - will paste_in_chat the command for them
 
 -- !!! let's add this to the top with some red text and a button to enable In Game Navigation if it's not on when the options panel gets refreshed
 if C_CVar.GetCVar("showInGameNavigation") == "0" then
@@ -1470,6 +1735,7 @@ local function on_addon_loaded()
             {"M", waym, {"m", "map"}},
             {"C", wayc, {"c", "clear"}},
             {"P", wayp, {"p", "ping"}},
+            {"R", wayr, {"r", "run"}},
             {"S", ways, {"s", "super", "supertrack"}},
             {"T", wayt, {"t", "tar", "target"}},
             {"ME", wayme, {"me"}},
@@ -1488,27 +1754,25 @@ local function on_addon_loaded()
     -- Set up event handlers
     do
         pinpin_frame:UnregisterEvent("ADDON_LOADED")
-        local events = {
+        local event_handlers = {
             PLAYER_LOGOUT = on_player_logout,
             MINIMAP_PING = on_minimap_ping,
             SUPER_TRACKING_CHANGED = on_super_tracking_changed,
             PLAYER_REGEN_ENABLED = on_player_regen_enabled
         }
-        for event, handler in pairs(events) do
+        for event in pairs(event_handlers) do
             pinpin_frame:RegisterEvent(event)
         end
         pinpin_frame:SetScript("OnEvent", function(self, event, ...)
-            events[event](...)
+            event_handlers[event](...)
         end)
     end
 
     -- Restore logout waypoint
-    do
-        if saved_variables.save_logout_waypoint then
-            local logout_waypoint = saved_variables_per_character.logout_waypoint
-            if logout_waypoint then
-                set_waypoint(logout_waypoint.uiMapID, logout_waypoint.position, logout_waypoint.desc)
-            end
+    if saved_variables.save_logout_waypoint then
+        local logout_waypoint = saved_variables_per_character.logout_waypoint
+        if logout_waypoint then
+            set_waypoint(logout_waypoint.uiMapID, logout_waypoint.position, logout_waypoint.desc)
         end
     end
     saved_variables_per_character.logout_waypoint = nil
