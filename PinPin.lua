@@ -416,29 +416,36 @@ do
 end
 -- End Process Maps for Name and Data
 
--- do_after_combat(preemptable, function, args...) to call protected functions once combat ends
+-- handle = do_after_combat(function, args...) to call protected functions once combat ends
+-- do_after_combat_preempt(handle) to cancel
 local do_after_combat, do_after_combat_preempt, on_player_regen_enabled
 do
-    local to_do_after_combat = {}
+    local queue = {} -- stores a queue of handles
+    local funcs = {} -- maps handles to function calls
 
     function on_player_regen_enabled() -- PLAYER_REGEN_ENABLED event detects end of combat
-        for _, to_do in pairs(to_do_after_combat) do
-            to_do.func(unpack(to_do.args))
+        for i = 1, #queue do
+            local handle = queue[i]
+            local funcs_entry = funcs[handle]
+            if funcs_entry then
+                funcs_entry.func(unpack(funcs_entry.args))
+            end
         end
-        to_do_after_combat = {}
+        queue = {}
+        funcs = {}
     end
 
     function do_after_combat(func, ...)
         local handle = {}
-        to_do_after_combat[handle] = {func = func, args = {...}}
+        queue[#queue + 1] = handle
+        funcs[handle] = {func = func, args = {...}}
         return handle
     end
 
     function do_after_combat_preempt(handle)
-        if not handle then
-            return
+        if handle then
+            funcs[handle] = nil
         end
-        to_do_after_combat[handle] = nil
     end
 end
 
