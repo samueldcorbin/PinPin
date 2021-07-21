@@ -10,7 +10,7 @@ Adds chat commands for in-game map pins that are easily shareable with other pla
 
   * Better map pin tooltips
   
-  * Allow map pins in more areas (can still be shared with people without the addon even though they can't place these pins themselves!)
+  * Allow map pins in more areas (can still be shared with people without the addon even for some places they can't place these pins themselves!)
 
   * Configurable (including unlimited) distance for map pin visibility
   
@@ -38,4 +38,4 @@ All enhancements to the default pin system can be toggled on or off individually
 
 Future plans include the ability to import and view multiple map pins simultaneously.
 
-\* The map naming scheme (e.g., "Nagrand:Outlands") is similar to TomTom, but it is possible for map names to differ because TomTom specifies some names by hand. I haven't discovered any that differ so far. It is also possible that there are some maps that TomTom can place pins on that PinPin can't due to the way the game's native pin system works, but, if they exist, I haven't run into them yet either.
+\* The map naming scheme (e.g., "Nagrand:Outlands") is similar to TomTom, but a few map names may differ.
